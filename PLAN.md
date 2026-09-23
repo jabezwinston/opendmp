@@ -46,7 +46,10 @@ is shipped or needed** (see B1 below).
   - **Since:** `s.fsync` compiled on both chips (ICM: FSYNC toggled on the rig, 6 edges,
     bit-exact); a pass-time bound with loops at their trip counts and calls at their routines'
     bounds (`build.cycles_max()`: exact for straight-line code, within 10 % of unit_vectors'
-    worst inputs, open for `while`); `run --watch-output` CSV.
+    worst inputs, open for `while`); `run --watch-output` CSV; `dmp.div` (exact restoring
+    division for every input, bit-exact on both rigs); a per-construct method report in
+    `opendmp build` and the listing; ADD/RSUB chains for sums without products; hops at dead
+    points.
 
 ## 1. Decisions (2026-09-23)
 

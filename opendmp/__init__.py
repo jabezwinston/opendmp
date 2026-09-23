@@ -19,6 +19,7 @@ __version__ = "0.0.1"
 from .api import (Bits, Program, Sub, assume, bits, clamp, emit, irq, loop, param, program,  # noqa: E402
                   state, sub)
 from . import quat  # noqa: E402
+from .lib import div  # noqa: E402
 
 __all__ = ["Bits", "Program", "Sub", "assume", "bits", "clamp", "emit", "irq", "loop", "param",
-           "program", "state", "sub", "quat"]
+           "program", "state", "sub", "quat", "div"]

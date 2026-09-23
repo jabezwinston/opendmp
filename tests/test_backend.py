@@ -163,3 +163,43 @@ def test_fsync(tmp_path, chip):
     assert p.simulate(ss, "ir").packets == p.simulate(ss).packets
     b = p.build(chip, trace=True)
     assert b.fsync and [s.fsync for s in map(b.trace_sample, b.emulate(ss).packets)] == [s.fsync for s in ss]
+
+
+def test_div_is_exact_everywhere():
+    """dmp.div: truncated toward zero, exact to the last bit, saturating at |q| >= 2 and y = 0,
+    for every input including -2.0 -- on the reference, and on both chips' bytes."""
+    p = program(next(x for x in EXAMPLES if x.stem == "slope"))
+    edge = [-32768, -32767, -16384, -1, 0, 1, 16383, 16384, 32767]
+    rnd = random.Random(11)
+    ss = [Sample(ax=a, az=z) for a in edge for z in edge]
+    ss += [Sample(ax=rnd.randint(-32768, 32767), az=rnd.randint(-32768, 32767)) for _ in range(150)]
+    ref = p.simulate(ss)
+    assert not ref.assume_fails
+    for s, pk in zip(ss, ref.packets):
+        x, y = s.ax << 16, s.az << 16
+        neg = (x < 0) != (y < 0)
+        if y == 0 or abs(x) >= 2 * abs(y):
+            want = (1 << 31) - 1
+        else:
+            want = (abs(x) << 30) // abs(y)
+        assert int.from_bytes(pk[:4], "big", signed=True) == (-want if neg else want), (s.ax, s.az)
+    for chip in CHIPS:
+        check(p, chip, ss)
+
+
+def test_method_notes():
+    """`opendmp build` says, per construct and line, how it was compiled."""
+    tilt = program(next(x for x in EXAMPLES if x.stem == "tilt")).build("mpu6050")
+    lines = tilt.explain()
+    assert any(l.startswith("tilt.py:33") and "one CLAMP instruction" in l for l in lines)
+    assert any(l.startswith("tilt.py:35") and "RSUB" in l for l in lines)
+    uv = program(next(x for x in EXAMPLES if x.stem == "unit_vectors"))
+    assert any("unit(): one routine, called here" in l for l in uv.build("icm20948").explain())
+    assert any("unit(): inlined here (the MPU has no call)" in l for l in uv.build("mpu6050").explain())
+    assert any("at most 15 trips" in l for l in uv.build("mpu6050").explain())
+    sl = program(next(x for x in EXAMPLES if x.stem == "slope")).build("mpu6050")
+    assert any("dmp.div: exact restoring division" in l for l in sl.explain())
+    assert not any("lib.py" in l for l in sl.explain())            # the library's insides stay hidden
+    bq = program(next(x for x in EXAMPLES if x.stem == "biquad")).build("icm20948")
+    assert sum("biquad(): a helper, inlined here" in l for l in bq.explain()) == 1   # merged
+    assert "  ;   -> `" in tilt.listing()

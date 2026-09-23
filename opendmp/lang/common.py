@@ -105,6 +105,9 @@ def module_attr(base, attr, err):
         if attr == "quat":
             from .. import quat
             return quat
+        if attr == "div":                   # the standard library, written in the language
+            from .. import lib
+            return getattr(lib, attr)
         if attr in ("state", "param"):
             raise err(f"dmp.{attr} belongs in a declaration: `x: dmp.{attr} = 0.0`", None)
         if attr in ("sub", "program"):

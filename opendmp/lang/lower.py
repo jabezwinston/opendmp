@@ -27,10 +27,10 @@ from ..ir import nodes as N
 from ..q30 import s32, to_q30
 from .common import (CMP_OPS, FIELD_NAME, SENSOR_GROUPS, ApiFn, Builtin, DmpNS, Folder, LoopVar,
                      SensorGroup, SensorNS, global_name, is_const, is_math, is_number, module_attr)
-from .errors import DmpError, Loc, node_text
+from .errors import DmpError, Loc, library_file, node_text
 from .source import function_source
 
-HINT_DIV = "multiply by a constant reciprocal (x * (1 / C)), or use a Newton step (examples/unit_vectors.py)"
+HINT_DIV = "dmp.div(x, y) divides exactly (restoring division); x / C by a constant is a multiply"
 HINT_MIX = ("an int literal makes an Int (a counter); write 0.0 for a Q30 value, or keep counters "
             "and Q30 values apart")
 
@@ -57,6 +57,7 @@ class Lowerer:
         self.vars: list = []
         self.subs: dict = {}
         self.uses: set = set()
+        self.notes: list = []
         self.frames: list = []
         self.calls: list = []             # helper call stack (recursion check)
         self.n = 0
@@ -73,6 +74,12 @@ class Lowerer:
 
     def loc(self, node):
         return Loc.of(node, self.f.file)
+
+    def note(self, node, text):
+        """How a construct in the user's source is being compiled (`opendmp build` shows these)."""
+        loc = self.loc(node)
+        if loc is not None and not library_file(loc.file):
+            self.notes.append((loc, text))
 
     def err(self, msg, node=None, hint=None):
         return DmpError(msg, self.loc(node) if node is not None else None, hint)
@@ -143,7 +150,7 @@ class Lowerer:
         ordered = [v for v in self.vars if v.kind in ("state", "param")] + \
                   [v for v in self.vars if v.kind not in ("state", "param")]
         return N.ProgramIR(self.program.name, src.file, dict(self.program.opts), ordered, stmts,
-                           packet, self.subs, self.uses)
+                           packet, self.subs, self.uses, self.notes)
 
     @staticmethod
     def is_docstring(st, fn):
@@ -372,6 +379,7 @@ class Lowerer:
             rng = range(*args)
             if len(rng) > 4096:
                 raise self.err(f"range({', '.join(map(str, args))}) unrolls to {len(rng)} copies", it)
+            self.note(it, f"unrolled: {len(rng)} copies of the body, {st.target.id} a constant in each")
             has_break = self.loop_has_break(st.body)
             label = self.label("for")
             fr.loops.append((label, "range"))
@@ -928,6 +936,8 @@ class Lowerer:
                 raise self.err("/ divides Q30 values only", node, "Int and dmp.bits values do not divide")
             recip = N.Const(N.Q30, self.q30(1 / c, node.right, f"1 / {node_text(node.right)}"),
                             loc=self.loc(node.right))
+            self.note(node, f"a multiply by 1 / {node_text(node.right)} = {1 / c:.9g}, rounded to Q30 "
+                            "(the DMP has no divide)")
             terms.append((coef * sa, "prod", (a, recip), node))
             return
         v = self.expr(node)
@@ -1178,6 +1188,8 @@ class Lowerer:
 
     # ------------------------------------------------------------------ helpers and subs
     def inline(self, fn, args, node):
+        self.note(node, f"{fn.__module__.replace('opendmp.', 'dmp.') + '.' if library_file(function_source(fn).file) else ''}"
+                        f"{fn.__name__}(): a helper, inlined here")
         if fn in self.calls:
             raise self.err(f"{fn.__name__} calls itself: recursion is not supported", node,
                            "helpers are inlined; write the recursion as a dmp.loop")

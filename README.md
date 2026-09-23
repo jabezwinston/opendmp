@@ -11,10 +11,10 @@ knowledge comes from the sibling reverse-engineering repo, `~/Git_repos/Invensen
 **Today:**
 - **The language's front end.** It parses, types, simulates and range-checks programs, and
   there are two independent executable semantics that agree bit for bit.
-- **The compiler**, for both chips. All 12 examples build, and their bytes run in the emulator
+- **The compiler**, for both chips. All 13 examples build, and their bytes run in the emulator
   equal the reference semantics on every pass.
 - **The host runtime.** It loads a program over the bench bridge, streams its packets, reads
-  states and writes params while it runs, and verifies a run on silicon. **All 12 examples are
+  states and writes params while it runs, and verifies a run on silicon. **All 13 examples are
   bit-exact on both parts.**
 - **The cycle-accurate emulator.**
 - **The ISA tools:** assembler, disassembler, and the machine facts.
@@ -109,6 +109,10 @@ What the compiler does (PLAN.md §6):
   and in mode 4 (after any branch) a branch is one byte (ISA2 Finding 42), as in the vendor's
   own eMD code. The ICM has 16-bit jumps.
 - **Subs**: on the ICM a `@dmp.sub` called more than once is one routine (`call`/`ret`).
+- **Division**: `x / C` is a multiply; `dmp.div(x, y)` is exact restoring division, written in
+  the language (`opendmp/lib.py`), for every input.
+- **Sums without products** are ADD/RSUB chains: the same value modulo 2³², cheaper than a MAC
+  run.
 - **Clean-up and layout.** Copy propagation and dead-store elimination run over the
   control-flow graph. The layout of words in RAM is then searched, scored by the scheduler's
   actual bytes and cycles (pointer loads were over a third of all code). On the ICM, MAC
@@ -127,13 +131,16 @@ What the compiler does (PLAN.md §6):
 | taps | 116 | 962 | 136 | 853 | 8 |
 | mahony | 190 | 4,575 | 221 | 2,668 | 16 |
 | despike | 341 | 3,094 | 383 | 2,705 | 12 |
-| unit_vectors | 409 | 18,896 | 267 | 11,548 | 28 |
+| unit_vectors | 359 | 15,780 | 261 | 11,099 | 28 |
+| slope (`dmp.div`) | 266 | 10,679 | 287 | 8,724 | 8 |
 
-Cycles are the emulator's on walking and shaking motion. Every build also carries an upper bound
-on a pass, loops at their trip counts (`build.cycles_max()`, the listing's last line): 27,384
-cycles on the MPU for unit_vectors, 3.3 ms of its 10 ms period, against 24,859 on its worst
+Cycles are the emulator's on walking and shaking motion. `opendmp build` also lists, per
+construct and line, the method it chose (`docs/language.md` §11). Every build also carries an
+upper bound
+on a pass, loops at their trip counts (`build.cycles_max()`, the listing's last line): 23,071
+cycles on the MPU for unit_vectors, 2.8 ms of its 10 ms period, against 20,828 on its worst
 inputs. Before the Phase 5 optimisations the twelve came to 5,099 bytes;
-they are now 3,134 (−39 %), with 22 % fewer worst-case cycles.
+they are now 3,078 (−40 %).
 
 ## Running on silicon
 
@@ -154,7 +161,7 @@ reference semantics, and every packet and interrupt must match:
 mahony on the icm20948: 155 passes at 50.0 Hz; emulator 0 and reference 0 packets differ; interrupts 0 on silicon, 0 emulated; 4394-4394 cycles a pass: BIT-EXACT
 ```
 
-All 12 examples verify on both rigs, about 3,700 passes in all, before and after the Phase 5
+All 13 examples verify on both rigs, about 4,000 passes in all, before and after the Phase 5
 optimisations. The first runs did not; the misses led to four ISA behaviours that no one had
 documented (ISA2.md Finding 40, below).
 

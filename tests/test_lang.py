@@ -238,7 +238,7 @@ def test_range_warning_names_the_fix(mk):
 
 # ------------------------------------------------------------------ what is refused
 REJECTS = [
-    ("x = s.accel.x / s.accel.y\ndmp.emit(x=x)", "division by a variable", "reciprocal"),
+    ("x = s.accel.x / s.accel.y\ndmp.emit(x=x)", "division by a variable", "dmp.div"),
     ("x = math.sqrt(s.accel.x)\ndmp.emit(x=x)", "needs constant arguments", "Newton"),
     ("x = s.accel.x ** 2\ndmp.emit(x=x)", "** is not supported", "x * x"),
     ("h: dmp.state = [0.0, 0.0]\nfor _ in dmp.loop(2):\n    x = h[_]\ndmp.emit(h0=h[0])",

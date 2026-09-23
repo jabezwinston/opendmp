@@ -264,6 +264,7 @@ class ProgramIR:
     packet: list              # [Field]
     subs: dict = field(default_factory=dict)
     uses: set = field(default_factory=set)    # sensor fields read
+    notes: list = field(default_factory=list)  # [(Loc, text)]: how the front end read constructs
 
     @property
     def states(self):

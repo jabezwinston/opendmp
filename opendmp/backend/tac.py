@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from ..ir import nodes as N
 from ..ir.ranges import analyse
 from ..q30 import ONE, s32
-from ..lang.errors import DmpError
+from ..lang.errors import DmpError, library_file
 
 MIN_WORD = -(1 << 31)             # -2.0
 
@@ -184,6 +184,11 @@ class Selector:
         self.pending: list = []
         self.calls = count_calls(ir.body, {})
         self.depth = {}
+        self.notes: list = []                      # [(Loc, text)]: the method chosen, per construct
+
+    def note(self, loc, text):
+        if loc is not None and not library_file(loc.file):
+            self.notes.append((loc, text))
 
     def may_be_min(self, e) -> bool:
         """Can e be exactly -2.0 (the one value `rsub` cannot subtract)?"""
@@ -225,9 +230,12 @@ class Selector:
             self.sample_words[k] = w
         return w
 
-    def sensor(self, f: str) -> Word:
+    def sensor(self, f: str, loc=None) -> Word:
         """A word holding the sensor's Q30 value (raw << 16), extracted in the prologue; for
         fsync, the Int 0 or 1."""
+        if f == "fsync":
+            self.note(loc, "bit 0 of the temperature sample, masked out once per pass; the runtime "
+                           "sets EXT_SYNC_SET so the FSYNC level lands there")
         w = self.sensor_words.get(f)
         if w is None:
             w = Word(f"s.{f}", "temp")
@@ -355,6 +363,7 @@ class Selector:
 
     def loop(self, s: N.Loop):
         if s.count is None:                         # while: a backward branch on both cores
+            self.note(s.loc, "a real loop (a branch back); no trip count, so no pass-time bound")
             end = self.scoped(s.label)
             top = self.new_label("top")
             self.emit(Label(top, loop_head=True))
@@ -373,6 +382,8 @@ class Selector:
         # a real loop, on both cores: the MPU branches back up to 32 bytes (probe101), and
         # relaxation chains hops for longer bodies.  The counter runs N-1 .. -1; DEC's F (the
         # exact sign of its result) ends the loop.
+        self.note(s.loc, f"a real loop: a counter from {s.count - 1}, DEC, a branch back while it is "
+                         f"not negative; at most {s.count} trips")
         counter = self.temp("n")
         self.emit(Mov(counter, self.const(s.count - 1), loc=s.loc))
         top = self.new_label("top")
@@ -389,12 +400,19 @@ class Selector:
         vals = [self.operand(a) for a in s.args]
         for p, v in zip(sub.params, vals):
             self.move(self.word(p), v)
+        what = ("dmp.div: exact restoring division (the integer bit, then 30 fraction bits, "
+                "saturating); " if sub.loc is not None and library_file(sub.loc.file) and sub.name == "div"
+                else f"{sub.name}(): ")
         if self.as_routine(sub):
             if sub not in self.routines:
                 self.routines[sub] = self.new_label(f"sub.{sub.name}")
                 self.pending.append(sub)
+            self.note(s.loc, what + f"one routine, called here (call / ret); {self.calls[sub]} call sites share it")
             self.emit(Call(self.routines[sub], loc=s.loc))
         else:
+            self.note(s.loc, what + ("inlined here (the MPU has no call)" if not self.icm else
+                                     "inlined here (called once)" if self.calls.get(sub, 0) < 2 else
+                                     "inlined here (the return stack is 4 deep)"))
             self.block(sub.body)
         for o, r in zip(s.outs, sub.results):
             self.move(self.word(o), self.word(r))
@@ -423,13 +441,19 @@ class Selector:
         else:                                      # gt / le: b < a
             self.lt(c.a, b, a, when if op == "gt" else not when, label, c.loc)
 
-    def lt(self, y_expr, x: Word, y: Word, when: bool, label: str, loc=None):
+    def lt(self, y_expr, x: Word, y: Word, when: bool, label: str, loc=None, quiet=False):
         """Branch to label when (x < y) == when.  rsub cannot subtract -2.0, so where y can be
         exactly -2.0 a guard decides that case first (nothing is less than -2.0)."""
         if not self.may_be_min(y_expr):
+            if not quiet:
+                self.note(loc, "RSUB into a scratch word, then a branch on its sign (the f5 compare "
+                               "only tests signs)")
             self.emit(Cmp(x, y, self.get_scratch(), loc=loc))
             self.emit(BranchIf(label, when, loc=loc))
             return
+        if not quiet:
+            self.note(loc, "RSUB into a scratch word, then a branch on its sign, guarded: a subtrahend "
+                           "of exactly -2.0 is possible here, and RSUB would add it (Finding 40)")
         # F := y - (-2.0 + 1 lsb) < 0, i.e. y == -2.0 (the subtrahend here is safe)
         self.emit(Cmp(y, self.const(MIN_WORD + 1), self.get_scratch(), loc=loc))
         if when:
@@ -447,10 +471,13 @@ class Selector:
         """Branch to label when (a == b) == when: rsub with a subtrahend that cannot be -2.0,
         or, when both can, the XOR of the two against zero."""
         if not self.may_be_min(a_expr):
+            self.note(loc, "RSUB, then TEST (F := the difference is 0)")
             self.emit(EqTest(a, b, self.get_scratch(), loc=loc))
         elif not self.may_be_min(b_expr):
+            self.note(loc, "RSUB, then TEST (F := the difference is 0)")
             self.emit(EqTest(b, a, self.get_scratch(), loc=loc))
         else:
+            self.note(loc, "XOR, then RSUB against 0 and TEST: both sides can be exactly -2.0")
             d = self.temp("xor")
             self.emit(Alu("xor", d, a, b, loc=loc))          # 0 exactly when equal
             self.emit(EqTest(d, self.const(0), self.get_scratch(), loc=loc))
@@ -464,7 +491,7 @@ class Selector:
         if isinstance(e, N.Const):
             return self.const(e.value)
         if isinstance(e, N.Sensor):
-            return self.sensor(e.field)
+            return self.sensor(e.field, e.loc)
         if isinstance(e, N.Assume):
             return self.operand(e.x)
         t = self.temp()
@@ -480,6 +507,8 @@ class Selector:
 
     def emit_field(self, e, loc):
         if isinstance(e, N.Sensor) and e.field != "fsync":   # a raw sensor emits its int16
+            self.note(e.loc or loc, "the sample's int16, 2 B straight from the sample page (a MOV under "
+                                    "a 16-bit lane mode)")
             k, half = self.sample_map[e.field]
             self.emit(Mov(FIFO, self.sample_word(k), lane=half, loc=loc))
             return
@@ -501,6 +530,7 @@ class Selector:
                 a, b = self.operand(e.a), self.operand(e.b)
                 self.select_cmp(dst, a, b, e, loc)
         elif isinstance(e, N.Abs):
+            self.note(e.loc or loc, "compare with 0, then NMUL by 1.0 where negative (abs(-2.0) wraps)")
             a = self.operand(e.x)
             out = self.temp() if dst is a else dst
             self.move(out, a, loc)
@@ -511,6 +541,7 @@ class Selector:
             self.emit(Label(skip))
             self.move(dst, out, loc)
         elif isinstance(e, N.Select):
+            self.note(e.loc or loc, "compare-and-skip: MOV the else value, test, skip the MOV of the other")
             a, b = self.operand(e.a), self.operand(e.b)
             out = self.temp() if dst in (a, b) else dst
             self.move(out, b, loc)
@@ -522,6 +553,7 @@ class Selector:
         elif isinstance(e, N.BitOp):
             a, b = self.operand(e.a), self.operand(e.b)
             if e.op == "or":                       # a | b = (a ^ b) ^ (a & b)
+                self.note(e.loc or loc, "no OR instruction: (a ^ b) ^ (a & b), 3 ops")
                 t1, t2 = self.temp(), self.temp()
                 self.emit(Alu("and", t1, a, b, loc=loc))
                 self.emit(Alu("xor", t2, a, b, loc=loc))
@@ -531,10 +563,12 @@ class Selector:
         elif isinstance(e, N.Shift):
             x = self.operand(e.x)
             if e.op == "shr":                      # x >> k = floor(x * 2^-k): a MUL
+                self.note(e.loc or loc, f"a MUL by 2^-{e.k}")
                 self.emit(Alu("mul", dst, x, self.const(1 << (30 - e.k)), loc=loc))
             elif e.k == 0:
                 self.move(dst, x, loc)
             else:                                  # x << k: k doublings
+                self.note(e.loc or loc, f"{e.k} doublings (ADD)")
                 cur = x
                 for i in range(e.k):
                     nxt = dst if i == e.k - 1 else self.temp()
@@ -566,12 +600,16 @@ class Selector:
             if lo is not None and hi is not None and lo <= hi:
                 x = e.a.a
                 if lo == -hi:                      # symmetric: one CLAMP for every x
+                    self.note(e.loc or loc, f"one CLAMP instruction (f5 op 0): x clamped to +-{hi / ONE:g}, "
+                                            "exact for every value (Finding 41)")
                     self.emit(Alu("clamp", dst, self.operand(x), self.const(hi), loc=loc))
                     return True
                 xl, xh = self.interval(x)
                 if (lo + hi) % 2 == 0:             # shift to symmetric: clamp(x - m, +-h) + m
                     m, h = (lo + hi) // 2, (hi - lo) // 2
                     if MIN_WORD <= xl - m and xh - m <= top:
+                        self.note(e.loc or loc, f"3 instructions: x - {m / ONE:g}, CLAMP to +-{h / ONE:g}, "
+                                                f"+ {m / ONE:g} (the range shows x - {m / ONE:g} cannot wrap)")
                         t = self.temp("clamp")
                         self.emit(Alu("rsub", t, self.const(m), self.operand(x), loc=loc))   # x - m
                         self.emit(Alu("clamp", t, t, self.const(h), loc=loc))
@@ -584,9 +622,12 @@ class Selector:
                 continue
             xl, xh = self.interval(x)
             if e.op == "min" and (xl >= 0 or (cv >= 0 and xl >= -cv)):
+                self.note(e.loc or loc, f"one CLAMP instruction: its range keeps x >= {max(0, -cv) / ONE:g}, "
+                                        "where the clamp is the minimum")
                 self.emit(Alu("clamp", dst, self.operand(x), self.const(cv), loc=loc))
                 return True
             if e.op == "max" and cv > MIN_WORD and (xh < 0 or (cv <= 0 and xh <= -cv)):
+                self.note(e.loc or loc, "one CLAMP instruction: its range keeps x where the clamp is the maximum")
                 self.emit(Alu("clamp", dst, self.operand(x), self.const(-cv), loc=loc))
                 return True
         return False
@@ -594,18 +635,57 @@ class Selector:
     def select_cmp(self, dst, a, b, e: N.MinMax, loc):
         """dst := min(a, b) or max(a, b), by an exact compare (MIN's flag has no simple rule,
         probe99, and its b - a can overflow)."""
+        guard = self.may_be_min(e.a if e.op == "min" else e.b)
+        self.note(e.loc or loc, "compare-and-skip: MOV one side, compare by RSUB, skip the MOV of the "
+                                "other" + (", with a -2.0 guard" if guard else "") +
+                                " (no CLAMP form holds for these ranges)")
         out = self.temp() if dst in (a, b) else dst
         self.move(out, a, loc)
         skip = self.new_label(e.op)
         if e.op == "min":                          # take b when b < a
-            self.lt(e.a, b, a, False, skip, loc)
+            self.lt(e.a, b, a, False, skip, loc, quiet=True)
         else:                                      # take b when a < b
-            self.lt(e.b, a, b, False, skip, loc)
+            self.lt(e.b, a, b, False, skip, loc, quiet=True)
         self.move(out, b, loc)
         self.emit(Label(skip))
         self.move(dst, out, loc)
 
     # ------------------------------------------------------------------ sums
+    def add_chain(self, dst: Word, V, loc) -> bool:
+        """A sum of plain terms (no products) as a chain of ADD / RSUB: the same value as the
+        exact sum modulo 2^32, which is what the language defines (the sum wraps once, at its
+        end), in one op fewer than it has terms.  The destination may be read only by the first
+        op, which reads before it stores."""
+        terms = [(c > 0, x) for c, x in V for _ in range(abs(c))]
+        if not 2 <= len(terms) <= 8:
+            return False
+        own = [t for t in terms if t[1] is dst]
+        rest = [t for t in terms if t[1] is not dst]
+        pos = [t for t in rest if t[0]]
+        if len(own) == 2 and own[0][0] and own[1][0]:
+            first = own                                   # dst + dst
+        elif len(own) == 1 and own[0][0] and rest:
+            first = [own[0], rest[0]]                     # dst +- x
+        elif len(own) == 1 and pos:
+            first = [pos[0], own[0]]                      # p - dst
+        elif not own and pos:
+            first = [pos[0], next(t for t in terms if t is not pos[0])]
+        else:
+            return False
+        remaining = list(terms)
+        for t in first:
+            remaining.remove(t)
+        (p1, x1), (p2, x2) = first
+        if p1 and p2:
+            self.emit(Alu("add", dst, x1, x2, loc=loc))
+        elif p1:
+            self.emit(Alu("rsub", dst, x2, x1, loc=loc))           # x1 - x2 = B - A
+        else:
+            self.emit(Alu("rsub", dst, x1, x2, loc=loc))           # x2 - x1
+        for positive, x in remaining:
+            self.emit(Alu("add", dst, dst, x, loc=loc) if positive else Alu("rsub", dst, x, dst, loc=loc))
+        return True
+
     def sum_(self, dst: Word, e: N.Sum, loc):
         prods, plain = [], []
         for t in e.terms:
@@ -619,6 +699,7 @@ class Selector:
             for (ca, xa), (cb, xb) in (((c1, x1), (c2, x2)), ((c2, x2), (c1, x1))):
                 if ca == 1 and isinstance(xa, N.Load) and self.word(xa.var) is dst and \
                         isinstance(xb, N.Const) and xb.value == 1 and cb in (1, -1):
+                    self.note(e.loc or loc, "one DEC" if cb == -1 else "one INC")
                     self.emit(IncDec(dst, cb == -1, loc=loc))
                     return
         # the operands first: nothing may run between the ops of a MAC run
@@ -630,19 +711,30 @@ class Selector:
                 if c == 1:
                     return self.move(dst, x, loc)
                 if c == -1:
+                    self.note(e.loc or loc, "negation: one NMUL by 1.0")
                     return self.emit(Alu("nmul", dst, x, self.const(ONE), loc=loc))
                 if c == 2:
+                    self.note(e.loc or loc, "doubling: one ADD")
                     return self.emit(Alu("add", dst, x, x, loc=loc))
             if len(V) == 2:
                 (c1, x1), (c2, x2) = V
                 if (c1, c2) == (1, 1):
+                    self.note(e.loc or loc, "one ADD")
                     return self.emit(Alu("add", dst, x1, x2, loc=loc))
                 if (c1, c2) == (1, -1):
+                    self.note(e.loc or loc, "one RSUB")
                     return self.emit(Alu("rsub", dst, x2, x1, loc=loc))    # x1 - x2 = B - A
                 if (c1, c2) == (-1, 1):
+                    self.note(e.loc or loc, "one RSUB")
                     return self.emit(Alu("rsub", dst, x1, x2, loc=loc))
+            n = len(self.ops)
+            if self.add_chain(dst, V, loc):
+                self.note(e.loc or loc, f"{len(self.ops) - n} ADD/RSUB in a chain (no products): the same "
+                                        "value as the exact sum, modulo 2^32")
+                return
         elif len(P) == 1 and not V and abs(P[0][0]) == 1:
             c, a, b = P[0]
+            self.note(e.loc or loc, "one MUL (floored)" if c == 1 else "one NMUL (floored)")
             return self.emit(Alu("mul" if c == 1 else "nmul", dst, a, b, loc=loc))
         one = self.const(ONE)
         terms = []
@@ -650,6 +742,8 @@ class Selector:
             terms += [(c < 0, a, b)] * abs(c)
         for c, x in V:
             terms += [(c < 0, x, one)] * abs(c)
+        self.note(e.loc or loc, f"one multiply-accumulate run of {len(terms)} terms (a plain value enters as "
+                                f"x * 1.0), summed exactly (Q60) and floored once")
         reads = [t for t in terms if dst in (t[1], t[2])]
         if reads:
             if len(reads) == 1:                    # dst read once: that term goes first

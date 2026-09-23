@@ -1,12 +1,12 @@
 # Examples
 
-Twelve programs, written in the opendmp language (PLAN.md §2). Each one builds for both chips
+Thirteen programs, written in the opendmp language (PLAN.md §2). Each one builds for both chips
 (`python -m opendmp build examples/tilt.py`). Its bytes run in the emulator bit-exact against
 the reference semantics (`tests/test_backend.py`), and it runs bit-exact on both bench rigs
 (`python -m opendmp run examples/tilt.py --port /dev/ttyUSB0 --verify`). The main README has
 the code size and cycles of each, and [docs/tutorial.md](../docs/tutorial.md) walks through `tilt.py`.
 
-All twelve pass `python -m opendmp check` with no range warning: interval analysis proves that
+All thirteen pass `python -m opendmp check` with no range warning: interval analysis proves that
 no value can wrap. Where it cannot see a fact, the program states it with `dmp.assume` and a
 comment giving the reason:
 - `biquad`: the filter's gain, the L1 norm of its impulse response, 1.091;
@@ -40,6 +40,7 @@ Two examples changed when the checker first ran:
 | `pid_level.py` | PID levelling with anti-windup | ranged params, saturation, derivative on the measurement |
 | `goertzel.py` | single-bin DFT tone detector (10 Hz) | a resonator with a coefficient near 2, a block counter, DC removal |
 | `unit_vectors.py` | exact normalisation via range reduction + Newton | `@dmp.sub` (a real call on the ICM), `dmp.loop` + `break`, early `return`, several return values |
+| `slope.py` | the board's slope, accel x / accel z, smoothed | `dmp.div` (exact division), a symmetric clamp, a ranged param |
 
 `emu/` is different: it is an **emulator demo** in assembly. `tilt.asm` is PLAN.md §3's
 hand-compiled tilt filter in opendmp assembly, with its data. `tilt.s` is the same program in

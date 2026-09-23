@@ -107,6 +107,7 @@ h: dmp.state = [0.0] * 4           # lists, nested lists: one word per element
 | `a + b`, `a - b`, `-a` | see the exact-sum rule below |
 | `a * b` | Q30 × Q30, floored; Int × constant integer |
 | `x / C`, `x * (1 / C)` | a constant C only: a multiply by the reciprocal |
+| `dmp.div(x, y)` | x / y for any Q30 values: truncated toward zero, exact to the last bit, saturating at ±(2 − 2⁻³⁰) when the quotient reaches 2 or y is 0 |
 | `x * 2**k`, `x << k` on Bits | doublings; `>>` on Bits |
 | `abs(x)` | `abs(-2.0)` wraps to −2.0 |
 | `min(a, b)`, `max(a, b)` | exact |
@@ -197,11 +198,18 @@ def unit(x, y, z):
 `dmp.quat` has quaternion helpers written in this language: `gravity(q)`, `rate_step(q, h)` and
 `normalize(q)`.
 
+`dmp.div(x, y)` is written in this language too (`opendmp/lib.py`). It is restoring long
+division: the integer bit, then 30 fraction bits, one compare and subtract each. It works on
+−|x| and −|y|, which always fit (|−2.0| would not), so it is exact for every input. Because it is
+compiled from its source, every engine, silicon included, computes the same bits. It is a
+`@dmp.sub`: one routine on the ICM when a program calls it twice or more, and inlined otherwise.
+It costs about 10,700 cycles on the MPU (1.3 ms) and 8,700 on the ICM (0.4 ms) at most.
+
 ## 10. Refused, with the hint the compiler gives
 
 | construct | hint |
 |---|---|
-| division by a variable | multiply by a constant reciprocal, or a Newton step (`examples/unit_vectors.py`) |
+| `x / y`, y a variable | `dmp.div(x, y)`: exact division, written out as the DMP does it |
 | `math.sqrt(x)` of a DMP value, `x ** 2` | a Newton step; `x * x` |
 | a list index that is not a constant | unroll with `range(N)`; there is no indirect addressing |
 | a helper that calls itself | helpers are inlined |
@@ -223,7 +231,31 @@ tilt.py:14:17: error: division by a variable: the DMP has no divide
 hint: multiply by a constant reciprocal (x * (1 / C)), or use a Newton step (examples/unit_vectors.py)
 ```
 
-## 11. How it compiles
+## 11. What the compiler tells you
+
+`opendmp build` lists, for every construct, the method it chose, with the line (`--quiet` turns
+it off). The listing repeats each under its source line:
+
+```
+tilt for the mpu6050: 45 B of code, packet 6 B, at most 82.0 us per pass (1.6 % of the period)
+  tilt.py:33  `dmp.clamp(K * (angle + s.gyro.y * GYRO_DT) + ...`: one CLAMP instruction (f5 op 0): x clamped to +-1.5, exact for every value (Finding 41)
+  tilt.py:33  `K * (angle + s.gyro.y * GYRO_DT) + (1 - K) * ...`: one multiply-accumulate run of 2 terms (a plain value enters as x * 1.0), summed exactly (Q60) and floored once
+  tilt.py:33  `angle + s.gyro.y * GYRO_DT`: one multiply-accumulate run of 2 terms (a plain value enters as x * 1.0), summed exactly (Q60) and floored once
+  tilt.py:34  `s.accel.z`: the sample's int16, 2 B straight from the sample page (a MOV under a 16-bit lane mode)
+  tilt.py:35  `angle > limit`: RSUB into a scratch word, then a branch on its sign (the f5 compare only tests signs)
+```
+
+These are the kinds of note:
+- **Front end:** a multiply by a reciprocal, `range()` unrolled, a helper inlined.
+- **Selection:** one ADD/RSUB/MUL/INC, an ADD chain, a MAC run, CLAMP forms and compare-and-skip,
+  compares (and whether they need the −2.0 guard), loops with their trip counts, subs as routines
+  or inlined, emits, FSYNC.
+- **Assembly:** branches that need hops.
+
+`Build.notes` has them as `(location, text)`, and `Build.explain()` as lines. A library function
+is summarised at its call site (`dmp.div: exact restoring division ...`), not line by line.
+
+## 12. How it compiles
 
 | construct | both chips |
 |---|---|
@@ -236,6 +268,8 @@ hint: multiply by a constant reciprocal (x * (1 / C)), or use a Newton step (exa
 | `if` | a branch over the body; far targets through hops |
 | `dmp.loop`, `while` | a counter or a condition, and a branch back |
 | `n += 1` on an Int | one INC |
+| a sum with no products (`a + b - c`, `r + r - b`) | a chain of ADD/RSUB: the same value modulo 2³² |
+| `dmp.div(x, y)` | the library routine (above) |
 
 **The pass-time bound.** A build computes an upper bound on a pass
 (`build.cycles_max()`, the listing's last line and the `.json`):

@@ -11,6 +11,23 @@ import pathlib
 from dataclasses import dataclass
 
 
+def library_file(file: str) -> bool:
+    """A file of opendmp itself (dmp.div, dmp.quat): its inner workings are not the user's."""
+    return pathlib.Path(file).resolve().parent == pathlib.Path(__file__).resolve().parent.parent
+
+
+def snippet(loc, width: int = 48) -> str:
+    """The source text a location covers, on one line, shortened to `width`."""
+    if loc is None:
+        return ""
+    line = linecache.getline(loc.file, loc.line).rstrip("\n")
+    text = line[loc.col:loc.end_col] if loc.end_line == loc.line else line[loc.col:].rstrip() + " ..."
+    if "#" in text and "'" not in text and '"' not in text:     # a comment, not the code
+        text = text[:text.index("#")].rstrip() + (" ..." if loc.end_line != loc.line else "")
+    text = " ".join(text.split())
+    return text if len(text) <= width else text[:width - 4] + " ..."
+
+
 @dataclass(frozen=True)
 class Loc:
     file: str

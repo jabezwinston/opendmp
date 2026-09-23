@@ -198,6 +198,9 @@ def cmd_build(a):
                     when += " -- OVER THE PERIOD"
             print(f"{p.name} for the {b.chip}: {b.size} B of code, packet {p.ir.packet_size} B, {when}"
                   f"  -> {', '.join(str(f) for f in files)}")
+            if not a.quiet:
+                for line in b.explain():
+                    print("  " + line)
     return rc
 
 
@@ -301,6 +304,7 @@ def main(argv=None):
                     help="the target (repeatable; default both)")
     bl.add_argument("-o", "--output", default="build", help="output directory (default build/)")
     bl.add_argument("--list", action="store_true", help="print the listing")
+    bl.add_argument("--quiet", action="store_true", help="do not list how each construct was compiled")
     bl.set_defaults(fn=cmd_build)
     for name, fn, hlp in (("check", cmd_check, "parse a program and report what can wrap"),
                           ("ir", cmd_ir, "print the IR the front end made")):

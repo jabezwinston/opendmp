@@ -37,6 +37,7 @@ class Build:
     labels: dict = field(default_factory=dict)
     hops: int = 0
     hop_target: dict = field(default_factory=dict)    # hop label -> the label it continues to
+    notes: list = field(default_factory=list)          # [(Loc, text)]: the method used, per construct
     trace: bool = False               # each packet starts with the pass's raw sample words
 
     # ------------------------------------------------------------------ numbers
@@ -132,11 +133,19 @@ class Build:
         lines = [f"; {self.ir.name}  opendmp  chip {self.chip} ({chip.clock_hz / 1e6:.3f} MHz)  "
                  f"entry {self.entry:#06x}  {o['rate']:g} Hz",
                  "; addr  bytes     asm                    effect                                   cycles"]
-        last = None
+        from ..lang.errors import snippet
+        by_line = {}
+        for loc, text in self.notes:
+            by_line.setdefault((loc.file, loc.line), []).append(f"`{snippet(loc, 36)}`: {text}")
+        shown, last = set(), None
         for e in self.out:
             if e.loc is not None and (last is None or (e.loc.file, e.loc.line) != (last.file, last.line)):
                 src = linecache.getline(e.loc.file, e.loc.line).strip()
                 lines.append(f"        ; {pathlib.Path(e.loc.file).name}:{e.loc.line}  {src}")
+                key = (e.loc.file, e.loc.line)
+                if key not in shown:
+                    shown.add(key)
+                    lines += [f"        ;   -> {n}" for n in by_line.get(key, [])]
                 last = e.loc
             if e.insn is None:
                 lines.append(f"      {e.label}:")
@@ -151,6 +160,11 @@ class Build:
         lines.append(f"; packet {self.ir.packet_size} B   {pk}")
         lines.append("; pass   " + self.budget() + (f"; {self.hops} branch hops" if self.hops else ""))
         return "\n".join(lines)
+
+    def explain(self) -> list:
+        """One line per construct: where it is, what it says, and how it was compiled."""
+        from ..lang.errors import snippet
+        return [f"{pathlib.Path(loc.file).name}:{loc.line}  `{snippet(loc)}`: {text}" for loc, text in self.notes]
 
     def budget(self) -> str:
         """The pass's cost against the sample period, in words."""
@@ -355,6 +369,26 @@ def size_of(e: Emitted, chip) -> int:
     return len(encode(e.insn, chip))
 
 
+def dead_points(out: list) -> list:
+    """Indices k where nothing falls through into out[k]: the instruction before it (with no
+    label between) is an unconditional branch or jump, the end of the pass, or a return."""
+    dead, armed = [], False
+    prev = None                                  # the previous entry, label or instruction
+    for k, e in enumerate(out):
+        if prev is not None and prev.insn is not None and (
+                prev.insn.op in ("end", "ret") or
+                (prev.insn.op in ("branch", "branch.m4", "jump") and not prev_armed)):
+            dead.append(k)
+        if e.insn is not None:
+            prev_armed = armed
+            if e.insn.op in ("if f", "if nf"):
+                armed = True
+            elif e.insn.op == "always":
+                armed = False
+        prev = e
+    return dead
+
+
 def mode_at(out: list, j: int):
     """The mode register in force just before out[j], from the instruction before it."""
     from ..isa.core import F4_OPS
@@ -374,10 +408,13 @@ def assemble(out: list, chip: str, entry: int):
     """Addresses, branch relaxation and the bytes.
 
     An MPU branch reaches 31 bytes forward and 32 back (a signed 6-bit field, probe101).  A
-    longer one goes through a hop: a branch placed
-    where no predicate is armed, which the code falling through steps over.  Far branches to
-    the same target share hops (a branch takes the furthest hop to its target it can reach), so
-    a target far away costs one hop every ~60 bytes, not one per branch."""
+    longer one goes through a hop, a one-byte branch on to the target (Finding 42):
+      - best, at a dead point, just after an unconditional branch or the end, where no code
+        falls through: the hop costs one byte and nothing on any other path;
+      - else where no predicate is armed, with a branch that steps the code falling through
+        over it (and restores the mode that step-over's f4 disturbed).
+    Far branches to the same target share hops (a branch takes the furthest hop to its target
+    it can reach), so a target far away costs one hop every ~60 bytes, not one per branch."""
     icm = chip == "icm20948"
     for e in out:
         # in mode 4 (after any f4) an MPU branch is one byte: the f4 is implied (Finding 42)
@@ -386,6 +423,7 @@ def assemble(out: list, chip: str, entry: int):
         e.size = 0 if e.insn is None else size_of(e, chip)
     hops = 0
     hop_target: dict = {}                      # hop label -> the label it continues to
+    notes = []
     for _ in range(100000):
         addr, labels = entry, {}
         for e in out:
@@ -406,6 +444,9 @@ def assemble(out: list, chip: str, entry: int):
             break
         e = out[far]
         final = hop_target.get(e.target, e.target)
+        if e.target not in hop_target and e.loc is not None:
+            notes.append((e.loc, "a branch from here reaches past the MPU's +-32 bytes: it goes on through "
+                                 "hops (one-byte branches, Finding 42)"))
         back = labels[e.target] < e.addr
         lo_reach, hi_reach = e.addr + e.size - 32, e.addr + e.size + 31
         shared = [h for h, t in hop_target.items() if t == final and lo_reach <= labels[h] <= hi_reach
@@ -414,29 +455,42 @@ def assemble(out: list, chip: str, entry: int):
             e.target = (min if back else max)(shared, key=lambda h: labels[h])
             e.insn = Insn(e.insn.op, (e.target,))
             continue
-        if back:                           # a hop at the earliest safe point it can reach, allowing
-            # for the 5 bytes the hop itself adds between it and the branch
-            cands = [k for k in range(far) if out[k].safe and out[k].addr + 2 >= lo_reach + 5
-                     and out[k].addr >= labels[final]]
-            j = cands[0] if cands else None
-        else:
-            cands = [k for k in range(far + 1, len(out)) if out[k].safe and out[k].addr + 2 <= hi_reach]
-            j = cands[-1] if cands else None
-        if j is None:
+        dead = dead_points(out)
+        pick = None
+        for need, pool in ((1, dead), (5, [k for k in range(len(out)) if out[k].safe])):
+            # a hop at a dead point adds 1 byte, a live one 5 (the step-over, the hop, a mode byte)
+            # a hop must bring the branch at least 4 bytes nearer its target, or relaxation
+            # would only move the problem (a dead point right after the branch itself, say)
+            if back:                       # the earliest point it can reach
+                cands = [k for k in pool if k < far and out[k].addr + 2 >= lo_reach + need
+                         and out[k].addr >= labels[final] and out[k].addr <= e.addr - 4]
+                j = cands[0] if cands else None
+            else:                          # the furthest point it can reach
+                cands = [k for k in pool if k > far and out[k].addr + need <= hi_reach + 1
+                         and out[k].addr >= e.addr + e.size + 4]
+                j = cands[-1] if cands else None
+            if j is not None:
+                pick = (j, pool is dead)
+                break
+        if pick is None:
             raise DmpError(f"a branch to {e.target} spans more than 32 bytes with no place for a hop")
+        j, at_dead = pick
         hops += 1
         hop, over = f"hop.{hops}", f"over.{hops}"
         loc = out[j].loc
         m = mode_at(out, j)
-        ins = [Emitted(Insn("branch.m4" if m == 4 else "branch", (over,)), target=over, safe=True,
-                       loc=loc, note="step over the hop", mode=m),
-               Emitted(None, label=hop, loc=loc),
-               Emitted(Insn("branch.m4", (final,)), target=final, loc=loc,     # one byte: mode 4
-                       note=f"hop on to {final}", mode=4),
-               Emitted(None, label=over, loc=loc)]
-        if m not in (None, 4):             # the step-over f4 left mode 4: restore what was in force
-            ins.append(Emitted(Insn("fmode", (m,)), loc=loc, note="restore the mode after the hop",
-                               mode=4))
+        hop_insn = Emitted(Insn("branch.m4", (final,)), target=final, loc=loc,      # one byte: mode 4
+                           note=f"hop on to {final}", mode=4)
+        if at_dead:                        # nothing falls through here: no step-over needed
+            ins = [Emitted(None, label=hop, loc=loc), hop_insn]
+        else:
+            ins = [Emitted(Insn("branch.m4" if m == 4 else "branch", (over,)), target=over, safe=True,
+                           loc=loc, note="step over the hop", mode=m),
+                   Emitted(None, label=hop, loc=loc), hop_insn,
+                   Emitted(None, label=over, loc=loc)]
+            if m not in (None, 4):         # the step-over f4 left mode 4: restore what was in force
+                ins.append(Emitted(Insn("fmode", (m,)), loc=loc, note="restore the mode after the hop",
+                                   mode=4))
         for x in ins:
             x.size = 0 if x.insn is None else size_of(x, chip)
         out[j:j] = ins
@@ -452,7 +506,7 @@ def assemble(out: list, chip: str, entry: int):
         insn = Insn(e.insn.op, (labels[e.target],)) if e.target is not None else e.insn
         e.bytes = encode(insn, chip, e.addr)
         code += e.bytes
-    return bytes(code), labels, hops, hop_target
+    return bytes(code), labels, hops, hop_target, notes
 
 
 def build(program, chip, trace: bool = False) -> Build:
@@ -464,7 +518,7 @@ def build(program, chip, trace: bool = False) -> Build:
     words = optimise([w for w in sel.words if id(w) in used or w.kind in ("state", "param")], ops, chip)
     out = schedule(ops, chip)
     entry = ENTRY[chip]
-    code, labels, hops, hop_target = assemble(out, chip, entry)
+    code, labels, hops, hop_target, asm_notes = assemble(out, chip, entry)
     if entry + len(code) > CODE_END[chip]:
         raise DmpError(f"{ir.name} needs {len(code)} bytes of code; the {chip} has "
                        f"{CODE_END[chip] - entry} from the entry point")
@@ -473,4 +527,20 @@ def build(program, chip, trace: bool = False) -> Build:
         if w.kind in ("state", "param", "const"):
             image[w.addr:w.addr + 4] = (w.init & MASK).to_bytes(4, "big")
     image[entry:entry + len(code)] = code
-    return Build(program, ir, chip, entry, image, code, out, words, labels, hops, hop_target, trace)
+    b = Build(program, ir, chip, entry, image, code, out, words, labels, hops, hop_target, trace=trace)
+    b.notes = _merge_notes(ir.notes + sel.notes + asm_notes)
+    return b
+
+
+def _merge_notes(notes):
+    """One entry per construct and method, in source order; not opendmp's own library code."""
+    from ..lang.errors import library_file
+    seen, out = set(), []
+    for loc, text in sorted(notes, key=lambda n: (n[0].file, n[0].line, n[0].col)):
+        if library_file(loc.file):
+            continue
+        key = (loc.file, loc.line, loc.col, text)
+        if key not in seen:
+            seen.add(key)
+            out.append((loc, text))
+    return out

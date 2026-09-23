@@ -108,7 +108,17 @@ From Python: `tilt.simulate(samples, engine="emu:icm20948")`, with samples from
 $ python -m opendmp build examples/tilt.py --list
 ```
 
-This writes `build/tilt.{mpu6050,icm20948}.{lst,asm,json,bin}` and prints the listing:
+This writes `build/tilt.{mpu6050,icm20948}.{lst,asm,json,bin}`. For each chip it says how every
+construct was compiled, with its line:
+
+```
+tilt for the mpu6050: 45 B of code, packet 6 B, at most 82.0 us per pass (1.6 % of the period)
+  tilt.py:33  `dmp.clamp(K * (angle + s.gyro.y * GYRO_DT) + ...`: one CLAMP instruction (f5 op 0): x clamped to +-1.5, exact for every value (Finding 41)
+  tilt.py:33  `angle + s.gyro.y * GYRO_DT`: one multiply-accumulate run of 2 terms (...), summed exactly (Q60) and floored once
+  tilt.py:35  `angle > limit`: RSUB into a scratch word, then a branch on its sign (the f5 compare only tests signs)
+```
+
+With `--list` it also prints the listing, where the same notes sit under each source line:
 
 ```
 ; addr  bytes     asm                    effect                                   cycles
@@ -155,7 +165,7 @@ upper bound: the longest path through the code, with loops at their trip counts 
 their routines' bounds. For unit_vectors on the MPU it reads
 
 ```
-; pass   409 B of code; at most 27384 cycles = 3339.9 us after the tick (33.4 % of 10000 us); loops at their trip counts; 16 branch hops
+; pass   359 B of code; at most 23071 cycles = 2813.9 us after the tick (28.1 % of 10000 us); loops at their trip counts; 10 branch hops
 ```
 
 A `while` loop has no trip count, so there the footer says the bound is open; the emulator
@@ -223,6 +233,7 @@ The twelve programs in `examples/` each exercise something:
 | quaternions, `dmp.quat`, cross products | `mahony.py`, `gyro_quat.py` |
 | params with ranges, saturation | `pid_level.py` |
 | `@dmp.sub`, `dmp.loop` with `break`, early `return` | `unit_vectors.py` |
+| division: `dmp.div`, exact for every input | `slope.py` |
 | the FSYNC input: `s.fsync` counts edges on the sync line | `language.md` §3 |
 
 **Loops.**
@@ -241,6 +252,8 @@ return); the MPU inlines it. Plain helper `def`s are always inlined.
 - **Prefer weighted forms for filters.** Write `(1-a)*y + a*x`, not `y + a*(x - y)`, whose
   difference can reach 4 and wrap before it is scaled.
 - **Clamp symmetrically when you can.** `dmp.clamp(x, -c, c)` is a single instruction.
+- **Divide by constants when you can.** `x / C` is one multiply; `dmp.div(x, y)` is exact but
+  costs about 1.3 ms on the MPU.
 - **Declare a range on every state that feeds back into itself**, and clamp it where a real input
   can push it out.
 - **Emit at the end of the pass, unconditionally**: packets have a fixed length.
