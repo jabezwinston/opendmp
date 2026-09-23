@@ -188,10 +188,14 @@ def cmd_build(a):
             files = b.write(a.output)
             from .emu.chips import get_chip
             c = get_chip(b.chip)
-            us = b.cycles_straight() * c.cycle_ns / 1000
-            when = (f"at most {us:.1f} us per pass ({100 * us * p.opts['rate'] / 1e6:.1f} % of the period)"
-                    if b.bounded else f"{us:.1f} us with every instruction once; loops run longer "
-                    "(`opendmp sim --engine emu:CHIP` counts them)")
+            bound = b.cycles_max()
+            if bound is None:
+                when = "no pass-time bound (a while loop)"
+            else:
+                us = bound * c.cycle_ns / 1000
+                when = f"at most {us:.1f} us per pass ({100 * us * p.opts['rate'] / 1e6:.1f} % of the period)"
+                if us * p.opts["rate"] > 1e6:
+                    when += " -- OVER THE PERIOD"
             print(f"{p.name} for the {b.chip}: {b.size} B of code, packet {p.ir.packet_size} B, {when}"
                   f"  -> {', '.join(str(f) for f in files)}")
     return rc
@@ -238,6 +242,13 @@ def _run(a, p, rig, verify, decode):
             print(f"{p.name} on the {rig.chip}: {len(packets)} packets at {rig.rate:.1f} Hz, {ints} interrupts")
             for t, vals in rig.watched:
                 print(f"  t {t:7.2f}  " + "  ".join(f"{n} {v:.6g}" for n, v in vals.items()))
+            if a.watch_output and rig.watched:
+                with open(a.watch_output, "w", newline="") as fh:
+                    w = csv.writer(fh)
+                    w.writerow(["t"] + watch)
+                    for t, vals in rig.watched:
+                        w.writerow([t] + [vals[n] for n in watch])
+                print(f"  wrote {a.watch_output}")
             ok = True
     for f in p.ir.packet:
         col = [d[f.name] for d in fields]
@@ -328,6 +339,7 @@ def main(argv=None):
     r.add_argument("--watch", action="append", default=[], metavar="NAMES",
                    help="read these states or params while running (comma-separated)")
     r.add_argument("--watch-period", type=float, default=0.5, help="seconds between readings")
+    r.add_argument("--watch-output", metavar="CSV", help="write the watched values as CSV (t, names...)")
     r.set_defaults(fn=cmd_run)
     f = sub.add_parser("facts", help="the machine facts the tools rely on, with their evidence")
     f.add_argument("--chip")

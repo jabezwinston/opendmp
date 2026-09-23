@@ -56,3 +56,9 @@ def test_int_state():
     assert ints
     rig.write(ints[0], 7)
     assert rig.read(ints[0]) == 7
+
+
+def test_run_actions_and_changes_are_validated_first():
+    rig = rig_for("pid_level")
+    with pytest.raises(ValueError, match="declared range"):
+        rig.run(1.0, changes=[(0.5, "setpoint", 0.9)])       # refused before anything starts

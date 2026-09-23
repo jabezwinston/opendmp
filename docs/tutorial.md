@@ -150,9 +150,17 @@ table the host needs.
 
 ## 5. The budget
 
-A pass must finish inside the sample period, 5 ms at 200 Hz. The listing's footer shows the cost
-of running every instruction once. For code with loops or calls it says so, and the emulator
-(`sim --engine emu:...`) counts the real pass. As a rule of thumb on the MPU-6050 (8.2 MHz):
+A pass must finish inside the sample period, 5 ms at 200 Hz. The listing's footer gives an
+upper bound: the longest path through the code, with loops at their trip counts and calls at
+their routines' bounds. For unit_vectors on the MPU it reads
+
+```
+; pass   409 B of code; at most 27384 cycles = 3339.9 us after the tick (33.4 % of 10000 us); loops at their trip counts; 16 branch hops
+```
+
+A `while` loop has no trip count, so there the footer says the bound is open; the emulator
+(`sim --engine emu:...`) still counts real passes. A bound over the period is flagged. As a rule
+of thumb on the MPU-6050 (8.2 MHz):
 - 5 cycles for a pointer, mode or predicate byte;
 - 18 for a MOV, 28 for an add or compare;
 - 58 for a multiply, 60 for a MAC step.
@@ -191,7 +199,7 @@ $ python -m opendmp run examples/pid_level.py --port /dev/ttyUSB0 --seconds 4 \
 
 - `--param` sets a param before the start.
 - `--set T:NAME=VALUE` changes it T seconds in.
-- `--watch` reads states while the program runs.
+- `--watch` reads states while the program runs, and `--watch-output watch.csv` saves them.
 
 A param with a declared range (`dmp.param(-0.3, 0.3)`) refuses values outside it. From Python:
 
@@ -215,6 +223,7 @@ The twelve programs in `examples/` each exercise something:
 | quaternions, `dmp.quat`, cross products | `mahony.py`, `gyro_quat.py` |
 | params with ranges, saturation | `pid_level.py` |
 | `@dmp.sub`, `dmp.loop` with `break`, early `return` | `unit_vectors.py` |
+| the FSYNC input: `s.fsync` counts edges on the sync line | `language.md` §3 |
 
 **Loops.**
 - `for i in range(N)` unrolls, so `i` is a constant and can index lists.

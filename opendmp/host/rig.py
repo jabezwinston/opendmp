@@ -44,8 +44,9 @@ class Rig:
             self.b.bank(bank)
         self.b.wr(reg, data)
 
-    def init(self, rate: float, gyro_fs: int, accel_fs: int):
-        """Device reset and the minimal register set for a DMP program at `rate`."""
+    def init(self, rate: float, gyro_fs: int, accel_fs: int, fsync: bool = False):
+        """Device reset and the minimal register set for a DMP program at `rate`.  fsync: put
+        the FSYNC level in bit 0 of the temperature sample (EXT_SYNC_SET = 1)."""
         b = self.b
         if self.chip == "mpu6050":
             b.wr(0x6B, 0x80)                            # PWR_MGMT_1: device reset
@@ -54,7 +55,7 @@ class Rig:
             time.sleep(0.02)
             b.wr(0x6A, 0x00)                            # USER_CTRL
             b.wr(0x19, max(0, min(255, round(1000 / rate) - 1)))   # SMPLRT_DIV: 1 kHz / (1 + div)
-            b.wr(0x1A, 0x03)                            # CONFIG: DLPF 42 Hz
+            b.wr(0x1A, 0x03 | (0x08 if fsync else 0))  # CONFIG: DLPF 42 Hz; EXT_SYNC_SET
             b.wr(0x1B, GYRO_FS[gyro_fs] << 3)
             b.wr(0x1C, ACCEL_FS[accel_fs] << 3)
             b.wr(0x38, 0x02)                            # INT_ENABLE: DMP_INT
@@ -74,6 +75,7 @@ class Rig:
             self.reg(2, 0x01, (GYRO_FS[gyro_fs] << 1) | 1)
             self.reg(2, 0x10, bytes([div >> 8, div & 0xFF]))   # ACCEL_SMPLRT_DIV
             self.reg(2, 0x14, (ACCEL_FS[accel_fs] << 1) | 1)
+            self.reg(2, 0x52, 0x01 if fsync else 0x00)  # FSYNC_CONFIG: EXT_SYNC_SET [probe83]
             self.reg(0, 0x0F, 0x00)                     # INT_PIN_CFG
             self.reg(0, 0x10, 0x02)                     # INT_ENABLE: DMP_INT1
             self.reg(0, 0x11, 0x00)
@@ -87,7 +89,7 @@ class Rig:
         if build.chip != self.chip:
             raise ValueError(f"a {build.chip} build on a {self.chip}")
         o = build.ir.opts
-        self.init(rate or o["rate"], o["gyro_fs"], o["accel_fs"])
+        self.init(rate or o["rate"], o["gyro_fs"], o["accel_fs"], fsync=build.fsync)
         end = CLEAR[self.chip]
         img = bytes(build.image[:end])
         self.b.mem_write(0, img)
@@ -164,15 +166,18 @@ class Rig:
 
         watch:   state or param names read every `period` seconds into self.watched, as
                  [(seconds since the start, {name: value})]
-        changes: [(at seconds, name, value)]: param writes made while the program runs"""
+        changes: [(at seconds, name, value)]: param writes made while the program runs, or
+                 [(at seconds, fn)]: fn(rig) called then (e.g. drive the bridge's FSYNC line),
+                 in this loop, so it never talks to the bridge at the same time as the reads"""
         size = self.build.packet_size
         cap = FIFO[self.chip]
         data = bytearray()
         todo = sorted(changes, key=lambda c: c[0])
         for name in watch:
             self._word(name)
-        for _, name, value in todo:
-            self._encode(name, value)               # refuse a bad change before starting
+        for c in todo:
+            if len(c) == 3:
+                self._encode(c[1], c[2])            # refuse a bad change before starting
         self.watched = []
         next_watch = 0.0
         self.start()
@@ -181,8 +186,11 @@ class Rig:
             while time.time() - t0 < seconds:
                 t = time.time() - t0
                 while todo and todo[0][0] <= t:
-                    _, name, value = todo.pop(0)
-                    self.write(name, value)
+                    c = todo.pop(0)
+                    if len(c) == 3:
+                        self.write(c[1], c[2])
+                    else:
+                        c[1](self)
                 if watch and t >= next_watch:
                     self.watched.append((round(t, 3), {n: self.read(n) for n in watch}))
                     next_watch = t + period

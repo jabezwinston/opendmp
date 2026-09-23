@@ -59,6 +59,9 @@ class Emitted:
     loc: object = None
     note: str = ""
     mode: int | None = None        # the mode register in force before it (for its cost)
+    loop_head: bool = False        # a label: a loop's head ...
+    trips: int | None = None       # ... whose body runs at most this often (None: unbounded)
+    entry: bool = False            # a label: a routine's entry
     addr: int = 0
     size: int = 0
     bytes: bytes = b""
@@ -298,7 +301,8 @@ class Scheduler:
         if op.entry:
             new = State()                   # a routine: reached from call sites in any state
         self.placed.add(op.name)
-        self.out.append(Emitted(None, label=op.name, safe=True, loc=self.loc))
+        self.out.append(Emitted(None, label=op.name, safe=True, loc=self.loc, loop_head=op.loop_head,
+                                trips=op.trips, entry=op.entry))
         self.st, self.reachable = new, True
         self.group = False
         if any(c for _, c in arr) or op.loop_head or op.entry:

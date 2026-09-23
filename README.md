@@ -129,8 +129,10 @@ What the compiler does (PLAN.md §6):
 | despike | 341 | 3,094 | 383 | 2,705 | 12 |
 | unit_vectors | 409 | 18,896 | 267 | 11,548 | 28 |
 
-Cycles are the emulator's on walking and shaking motion. 18,896 MPU cycles are 2.3 ms, inside
-unit_vectors' 10 ms period. Before the Phase 5 optimisations the twelve came to 5,099 bytes;
+Cycles are the emulator's on walking and shaking motion. Every build also carries an upper bound
+on a pass, loops at their trip counts (`build.cycles_max()`, the listing's last line): 27,384
+cycles on the MPU for unit_vectors, 3.3 ms of its 10 ms period, against 24,859 on its worst
+inputs. Before the Phase 5 optimisations the twelve came to 5,099 bytes;
 they are now 3,134 (−39 %), with 22 % fewer worst-case cycles.
 
 ## Running on silicon
@@ -164,7 +166,8 @@ python -m opendmp run examples/pid_level.py --port /dev/ttyUSB0 --seconds 4 \
 ```
 
 `--param` sets before the start, `--set T:NAME=VALUE` during the run, and `--watch` reads states
-as it goes. A write outside a param's declared range is refused.
+as it goes (`--watch-output` saves them as CSV). A write outside a param's declared range is
+refused. A program that reads `s.fsync` gets the FSYNC pin (the runtime sets `EXT_SYNC_SET`).
 
 From Python: `from opendmp.host import Rig, verify`; `rig = Rig(port)`, `rig.load(build)`,
 `rig.run(seconds, watch=[...], changes=[(t, name, value)])`, `rig.read(name)`,

@@ -34,7 +34,11 @@ def check(p, chip, samples):
 @pytest.mark.parametrize("path", EXAMPLES, ids=lambda p: p.stem)
 def test_example_bit_exact(path, chip):
     p = program(path)
-    check(p, chip, generate(MOTION, rate=p.opts["rate"], seconds=0.25))
+    emu = check(p, chip, generate(MOTION, rate=p.opts["rate"], seconds=0.25))
+    b = p.build(chip)
+    assert b.cycles_max() is not None and b.cycles_max() >= max(emu.cycles)   # the bound holds
+    if b.bounded and not any(e.insn is None and e.loop_head for e in b.out):
+        assert b.cycles_max() <= b.cycles_straight()
 
 
 @pytest.mark.parametrize("chip", CHIPS)
@@ -115,3 +119,47 @@ def test_while_on_both_cores(tmp_path, chip):
     f.write_text(WHILE_SRC)
     p = runpy.run_path(str(f))["w"]
     check(p, chip, generate(["shake", "walk", "tilt"], rate=100, seconds=0.5))
+    assert p.build(chip).cycles_max() is None and "no bound" in p.build(chip).listing()
+
+
+def test_loop_bound_under_worst_case_inputs():
+    """unit_vectors' trips depend on the data: 1-LSB vectors take all 15 doublings."""
+    p = program(next(x for x in EXAMPLES if x.stem == "unit_vectors"))
+    rnd = random.Random(5)
+    ss = [Sample(1, 1, 1, 1, 1, 1), Sample(0, 0, 0, 0, 0, 0), Sample(-1, 0, 0, 0, 0, -1),
+          Sample(32767, 32767, 32767, -32768, -32768, -32768)]
+    ss += [Sample(*(rnd.randint(-m, m) for _ in range(6))) for m in (1, 2, 3, 5, 8, 16, 64) for _ in range(20)]
+    for chip in CHIPS:
+        emu = check(p, chip, ss)
+        assert max(emu.cycles) <= p.build(chip).cycles_max() <= 1.15 * max(emu.cycles)
+
+
+FSYNC_SRC = '''
+import opendmp as dmp
+
+@dmp.program(rate=50)
+def sync(s):
+    edges: dmp.state = 0
+    last: dmp.state = 0
+    f = s.fsync
+    if f == 1:
+        if last == 0:
+            edges += 1
+    last = f
+    dmp.emit(fsync=f, edges=edges, temp=s.temp)
+'''
+
+
+@pytest.mark.parametrize("chip", CHIPS)
+def test_fsync(tmp_path, chip):
+    """s.fsync is the temperature's bit 0 with EXT_SYNC_SET = 1, which then also carries it in
+    s.temp; a trace build's replay recovers it from there."""
+    f = tmp_path / "sync.py"
+    f.write_text(FSYNC_SRC)
+    p = runpy.run_path(str(f))["sync"]
+    rnd = random.Random(3)
+    ss = [Sample(temp=rnd.randint(-32768, 32767), fsync=rnd.randint(0, 1)) for _ in range(200)]
+    check(p, chip, ss)
+    assert p.simulate(ss, "ir").packets == p.simulate(ss).packets
+    b = p.build(chip, trace=True)
+    assert b.fsync and [s.fsync for s in map(b.trace_sample, b.emulate(ss).packets)] == [s.fsync for s in ss]

@@ -176,9 +176,13 @@ class Machine:
                              _i16(s.gx), _i16(s.gy), _i16(s.gz), temp)
         else:
             # 0x000-0x00d in register-burst order, nothing else [HW, probe84, probe91 B2].
-            # 0x00e is not written: probe84's "constant 12" was its own tag's low half
+            # 0x00e is not written: probe84's "constant 12" was its own tag's low half.  With
+            # EXT_SYNC_SET = 1 the temperature's bit 0 is the FSYNC level here too [HW, probe105]
+            temp = _i16(s.temp)
+            if self.fsync_enabled:
+                temp = (temp & ~1) | (s.fsync & 1)
             struct.pack_into(">7h", self.mem, 0, _i16(s.ax), _i16(s.ay), _i16(s.az),
-                             _i16(s.temp), _i16(s.gx), _i16(s.gy), _i16(s.gz))
+                             temp, _i16(s.gx), _i16(s.gy), _i16(s.gz))
 
     # ------------------------------------------------------------------ passes
     def begin_pass(self, sample: Sample | None = None):

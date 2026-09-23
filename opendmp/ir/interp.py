@@ -124,8 +124,11 @@ class Interp:
             s = self.sample
             if e.field == "fsync":
                 return s.fsync & 1
+            temp = s.temp
+            if "fsync" in self.ir.uses:           # EXT_SYNC_SET = 1: FSYNC is the temperature's bit 0
+                temp = (temp & ~1) | (s.fsync & 1)
             raw = {"ax": s.ax, "ay": s.ay, "az": s.az, "gx": s.gx, "gy": s.gy, "gz": s.gz,
-                   "temp": s.temp}[e.field]
+                   "temp": temp}[e.field]
             return s32(raw << 16)
         if isinstance(e, N.Sum):
             total = 0

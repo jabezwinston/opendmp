@@ -115,6 +115,7 @@ class Label(Op):
     name: str
     loop_head: bool = False       # reached by a backward jump: nothing is known there
     entry: bool = False           # a routine's entry (ICM): reached only by calls
+    trips: int | None = None      # a loop head: the most times the body runs (None: a while)
 
 
 @dataclass(eq=False)
@@ -225,9 +226,8 @@ class Selector:
         return w
 
     def sensor(self, f: str) -> Word:
-        """A word holding the sensor's Q30 value (raw << 16), extracted in the prologue."""
-        if f == "fsync":
-            raise DmpError("s.fsync is not supported by the backend yet")
+        """A word holding the sensor's Q30 value (raw << 16), extracted in the prologue; for
+        fsync, the Int 0 or 1."""
         w = self.sensor_words.get(f)
         if w is None:
             w = Word(f"s.{f}", "temp")
@@ -257,6 +257,16 @@ class Selector:
         self.ops = saved
         # the prologue: pull every sensor used as a value out of the sample page
         for f, w in self.sensor_words.items():
+            if f == "fsync":
+                # with EXT_SYNC_SET = 1 the FSYNC level is bit 0 of the temperature sample
+                # [HW: ICM probe83; MPU probe105].  MPU: temp is word 1's low half, so the bit is
+                # bit 0; ICM: temp is word 4's high half, so bit 16, swapped down by a MOVX
+                if self.icm:
+                    self.emit(Alu("and", w, self.sample_word(4), self.const(0x10000)))
+                    self.emit(Mov(w, w, swap=True))
+                else:
+                    self.emit(Alu("and", w, self.sample_word(1), self.const(1)))
+                continue
             k, half = self.sample_map[f]
             self.emit(Clr(w))
             self.emit(Mov(w, self.sample_word(k), swap=(half == "lo"), lane="hi"))
@@ -366,7 +376,7 @@ class Selector:
         counter = self.temp("n")
         self.emit(Mov(counter, self.const(s.count - 1), loc=s.loc))
         top = self.new_label("top")
-        self.emit(Label(top, loop_head=True))
+        self.emit(Label(top, loop_head=True, trips=s.count))
         self.labels.append({s.label: end})
         self.block(s.body)
         self.labels.pop()
@@ -469,7 +479,7 @@ class Selector:
                 self.emit(Mov(dst, src, loc=loc))
 
     def emit_field(self, e, loc):
-        if isinstance(e, N.Sensor) and e.field != "fsync":
+        if isinstance(e, N.Sensor) and e.field != "fsync":   # a raw sensor emits its int16
             k, half = self.sample_map[e.field]
             self.emit(Mov(FIFO, self.sample_word(k), lane=half, loc=loc))
             return

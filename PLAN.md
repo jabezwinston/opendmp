@@ -43,8 +43,10 @@ is shipped or needed** (see B1 below).
 
     Two ISA findings came out of it, both measured on the rigs: `f5` op 0 is a symmetric clamp,
     not MIN (Finding 41), and the MPU's mode-4 low bytes are one-byte branches (Finding 42).
-- **Next:** `s.fsync` in the backend; a worst-case cycle bound for loops with known trip
-  counts; state readback into CSV from the CLI.
+  - **Since:** `s.fsync` compiled on both chips (ICM: FSYNC toggled on the rig, 6 edges,
+    bit-exact); a pass-time bound with loops at their trip counts and calls at their routines'
+    bounds (`build.cycles_max()`: exact for straight-line code, within 10 % of unit_vectors'
+    worst inputs, open for `while`); `run --watch-output` CSV.
 
 ## 1. Decisions (2026-09-23)
 

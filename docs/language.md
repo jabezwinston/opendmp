@@ -75,10 +75,15 @@ the value that reaches the DMP must fit. **Assigning to a local always makes a D
 | `s.gyro.x`, `.y`, `.z` | raw / 16384 | 1000 deg/s per unit at ±2000 deg/s |
 | `s.temp` | raw / 16384 | the temperature sensor's raw count |
 | `s.accel[i]`, `s.gyro[i]` | the same | the triples index like tuples, with constant indices |
+| `s.fsync` | an Int, 0 or 1 | the FSYNC pin's level this pass |
 
-Each is the 16-bit sample moved into the high half of a word. So it is Q30, and emitting it
-unchanged costs 2 bytes of packet. `s.fsync` (the ICM's FSYNC level) is accepted by the front end
-but not yet compiled.
+Each sensor is the 16-bit sample moved into the high half of a word. So it is Q30, and emitting
+it unchanged costs 2 bytes of packet.
+
+**`s.fsync`.** When a program reads it, the runtime sets `EXT_SYNC_SET = 1`. The hardware then
+puts the FSYNC level into bit 0 of the temperature sample, so `s.temp`'s lowest bit is the FSYNC
+level in that program, on every engine. It is measured on both parts' sample pages. The ICM rig's
+FSYNC is wired to the bridge (`Y 0|1`); the MPU rig's is not.
 
 ## 4. Declarations
 
@@ -231,6 +236,15 @@ hint: multiply by a constant reciprocal (x * (1 / C)), or use a Newton step (exa
 | `if` | a branch over the body; far targets through hops |
 | `dmp.loop`, `while` | a counter or a condition, and a branch back |
 | `n += 1` on an Int | one INC |
+
+**The pass-time bound.** A build computes an upper bound on a pass
+(`build.cycles_max()`, the listing's last line and the `.json`):
+- it is the longest path through the code as emitted, a far branch costing its hops;
+- each loop counts at its trip count (`dmp.loop(N)`), and each call at the routine's bound;
+- it is exact for straight-line code, and holds on every emulated pass;
+- a `while` loop leaves it open, and the listing says so.
+
+A bound over the sample period is flagged: the MPU would then drop to a lower rate.
 
 The MPU's branch reaches 32 bytes each way. The assembler chains longer branches through
 one-byte hops (ISA2 Finding 42), as the vendor's own compiler did. The layout of words in RAM is

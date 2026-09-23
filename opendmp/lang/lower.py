@@ -735,7 +735,7 @@ class Lowerer:
             if a in ("temp", "fsync"):
                 self.uses.add(a)
                 return N.Sensor(a, loc=self.loc(node))
-            raise self.err(f"the sample has no {a!r}", node, "it has accel, gyro, temp and fsync (ICM)")
+            raise self.err(f"the sample has no {a!r}", node, "it has accel, gyro, temp and fsync")
         if isinstance(base, SensorGroup):
             if a in ("x", "y", "z"):
                 f = base.prefix + a

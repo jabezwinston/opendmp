@@ -36,6 +36,7 @@ class Build:
     words: list                       # [tac.Word], placed
     labels: dict = field(default_factory=dict)
     hops: int = 0
+    hop_target: dict = field(default_factory=dict)    # hop label -> the label it continues to
     trace: bool = False               # each packet starts with the pass's raw sample words
 
     # ------------------------------------------------------------------ numbers
@@ -57,23 +58,38 @@ class Build:
         w = [packet[i:i + 4] for i in range(0, self.trace_bytes, 4)]
         h = lambda b, k: int.from_bytes(b[2 * k:2 * k + 2], "big", signed=True)
         if self.chip == "mpu6050":           # ax|ay az|temp gx|gy gz|-
-            return Sample(ax=h(w[0], 0), ay=h(w[0], 1), az=h(w[1], 0), temp=h(w[1], 1),
-                          gx=h(w[2], 0), gy=h(w[2], 1), gz=h(w[3], 0))
-        return Sample(ax=h(w[0], 0), ay=h(w[0], 1), az=h(w[1], 0), gx=h(w[1], 1),   # ax|ay az|gx
-                      gy=h(w[2], 0), gz=h(w[2], 1), temp=h(w[3], 0))                 # gy|gz temp|-
+            s = Sample(ax=h(w[0], 0), ay=h(w[0], 1), az=h(w[1], 0), temp=h(w[1], 1),
+                       gx=h(w[2], 0), gy=h(w[2], 1), gz=h(w[3], 0))
+        else:
+            s = Sample(ax=h(w[0], 0), ay=h(w[0], 1), az=h(w[1], 0), gx=h(w[1], 1),   # ax|ay az|gx
+                       gy=h(w[2], 0), gz=h(w[2], 1), temp=h(w[3], 0))                 # gy|gz temp|-
+        if self.fsync:
+            s.fsync = s.temp & 1             # the temperature's bit 0 carries it
+        return s
+
+    @property
+    def fsync(self) -> bool:
+        """The program reads s.fsync: the runtime sets EXT_SYNC_SET = 1, which puts the FSYNC
+        level in bit 0 of the temperature sample."""
+        return "fsync" in self.ir.uses
 
     @property
     def bounded(self) -> bool:
-        """True when no instruction can run twice in a pass: no backward branch, no call.  Then
-        cycles_straight() is an upper bound on the pass."""
-        for e in self.out:
-            if e.insn is None:
-                continue
-            if e.insn.op == "call":
-                return False
-            if e.target is not None and self.labels[e.target] <= e.addr:
-                return False
-        return True
+        """True when a pass has an upper bound: every loop has a trip count (no `while`)."""
+        return self.cycles_max() is not None
+
+    def cycles_max(self):
+        """An upper bound on a pass, in cycles after the sample tick, or None when a `while`
+        loop leaves it open.  The longest path through the code as emitted, where:
+          - a branch costs its taken cost, and a far branch the hops on the way;
+          - an instruction a false predicate skips is charged as executed (which costs more);
+          - a loop costs its trip count times its costliest trip, a break counting as a trip;
+          - a call costs the routine's own bound.
+        The MPU's sample-write stalls (14-28 cycles each, only in a pass that overruns its
+        period) are not included."""
+        if "_cmax" not in self.__dict__:
+            self.__dict__["_cmax"] = _wcet(self)
+        return self.__dict__["_cmax"]
 
     def cycles_straight(self) -> int:
         """Every instruction once, the start latency included: an upper bound on a pass for
@@ -91,6 +107,7 @@ class Build:
         m = Machine(self.chip)
         m.load(bytes(self.image), 0)
         m.entry = self.entry
+        m.fsync_enabled = self.fsync
         return m
 
     def emulate(self, samples, params: dict | None = None):
@@ -132,18 +149,27 @@ class Build:
         pk = "   ".join(f"{f.name} {'i16' if f.type == 's16' else f.type} [{f.offset}:{f.offset + f.width}]"
                        for f in self.ir.packet)
         lines.append(f"; packet {self.ir.packet_size} B   {pk}")
-        straight = self.cycles_straight()
-        period = 1e6 / o["rate"]
-        us = straight * chip.cycle_ns / 1000
-        if self.bounded:
-            lines.append(f"; pass   {self.size} B of code; at most {straight} cycles = {us:.1f} us after the "
-                         f"tick ({100 * us / period:.1f} % of {period:.0f} us)"
-                         + (f"; {self.hops} branch hops" if self.hops else ""))
-        else:
-            lines.append(f"; pass   {self.size} B of code; every instruction once: {straight} cycles = "
-                         f"{us:.1f} us; loops and calls run longer (the emulator counts them)"
-                         + (f"; {self.hops} branch hops" if self.hops else ""))
+        lines.append("; pass   " + self.budget() + (f"; {self.hops} branch hops" if self.hops else ""))
         return "\n".join(lines)
+
+    def budget(self) -> str:
+        """The pass's cost against the sample period, in words."""
+        chip = get_chip(self.chip)
+        period = 1e6 / self.ir.opts["rate"]
+        bound = self.cycles_max()
+        if bound is None:
+            once = self.cycles_straight()
+            return (f"{self.size} B of code; no bound: a while loop runs as long as its condition "
+                    f"holds (every instruction once: {once} cycles = {once * chip.cycle_ns / 1000:.1f} us)")
+        us = bound * chip.cycle_ns / 1000
+        loops = any(e.loop_head for e in self.out if e.insn is None) or \
+            any(e.insn is not None and e.insn.op == "call" for e in self.out)
+        text = (f"{self.size} B of code; at most {bound} cycles = {us:.1f} us after the tick "
+                f"({100 * us / period:.1f} % of {period:.0f} us)" + ("; loops at their trip counts" if loops else ""))
+        if us > period:
+            text += ("; OVER THE PERIOD: a pass can overrun, and " +
+                     ("the MPU then drops to a lower rate" if self.chip == "mpu6050" else "the ICM runs slower"))
+        return text
 
     def text(self, e):
         i = e.insn
@@ -205,7 +231,7 @@ class Build:
                                      "init": w.init} for w in self.words
                             if w.kind in ("state", "param")},
                 "code_size": self.size, "cycles_once": self.cycles_straight(),
-                "cycles_max": self.cycles_straight() if self.bounded else None}
+                "cycles_max": self.cycles_max()}
 
     def write(self, directory, stem=None) -> list:
         d = pathlib.Path(directory)
@@ -218,6 +244,104 @@ class Build:
         end = self.entry + self.size
         (d / f"{stem}.bin").write_bytes(bytes(self.image[:end]))
         return [d / n for n in list(files) + [f"{stem}.bin"]]
+
+
+def _wcet(b: "Build"):
+    """Worst-case cycles of a pass (Build.cycles_max): the longest path through the code as
+    emitted, loops collapsed innermost first, routines leaf first."""
+    chip = get_chip(b.chip)
+    out = b.out
+    ins = [i for i, e in enumerate(out) if e.insn is not None]
+    n = len(ins)
+    at_label, info, k = {}, {}, 0
+    for e in out:                                   # a label -> the instruction after it
+        if e.insn is None:
+            at_label[e.label], info[e.label] = k, e
+        else:
+            k += 1
+    E = [out[i] for i in ins]
+    call_extra = {}                                 # instruction -> its routine's bound
+
+    def cost(k):
+        e = E[k]
+        return chip.cyc(cost_key(e.insn, e.mode if e.mode is not None else 1)) + call_extra.get(k, 0)
+
+    def final(label):                               # through a chain of hops
+        extra = 0
+        while label in b.hop_target:
+            extra += cost(at_label[label])
+            label = b.hop_target[label]
+        return label, extra
+
+    # successors [(instruction, extra cycles on the edge)]; a branch under an armed predicate
+    # (an `if` not yet ended by `always`) may also fall through; backward branches close loops
+    succ, back, armed = [], {}, False
+    for k in range(n):
+        op = E[k].insn.op
+        armed = True if op in ("if f", "if nf") else False if op == "always" else armed
+        s = []
+        if op in ("end", "ret"):
+            pass
+        elif E[k].target is not None and op != "call":
+            lab, extra = final(E[k].target)
+            t = at_label[lab]
+            if t <= k:
+                head = info[lab]
+                if not head.loop_head or head.trips is None:
+                    return None                     # a while loop: the pass has no bound
+                back[t] = (max(back.get(t, (0, k))[0], k), head.trips)
+            else:
+                s.append((t, extra))
+            if armed:
+                s.append((k + 1, 0))
+        else:
+            s.append((k + 1, 0))
+        succ.append([(t, x) for t, x in s if t < n])
+    loops = {h: end for h, (end, _) in back.items()}
+    collapsed = {}                                  # loop head -> (cost, exits)
+
+    def longest(start, end, stops):
+        """The costliest path from `start` within [start, end] to a node in `stops` or out of the
+        region, collapsed inner loops counted whole; and where it can leave."""
+        dist, best, exits = {start: 0}, 0, []
+        k = start
+        while k <= end:
+            inner = k in collapsed and k != start
+            if k in dist:
+                c, nexts = collapsed[k] if inner else (cost(k), succ[k])
+                here = dist[k] + c
+                if k in stops:
+                    best = max(best, here)
+                for t, x in nexts:
+                    if start < t <= end and t > k:
+                        dist[t] = max(dist.get(t, -1), here + x)
+                    elif not start <= t <= end:
+                        best = max(best, here + x)
+                        exits.append(t)
+            k = loops[k] + 1 if inner else k + 1
+        return best, exits
+
+    def region(start, end):
+        """A region's bound: its calls first, then its loops innermost first."""
+        for k in range(start, end + 1):
+            if E[k].insn.op == "call":
+                call_extra[k] = routine(E[k].target)
+        for h in sorted((h for h in loops if start <= h <= end), key=lambda h: loops[h] - h):
+            trip, exits = longest(h, loops[h], {loops[h]})
+            collapsed[h] = (back[h][1] * trip, [(t, 0) for t in exits] + [(loops[h] + 1, 0)])
+        return longest(start, end, {end})[0]
+
+    bounds = {}
+
+    def routine(label):                             # entry .. its ret, each routine once
+        if label not in bounds:
+            start = at_label[label]
+            end = next(k for k in range(start, n) if E[k].insn.op == "ret")
+            bounds[label] = region(start, end)
+        return bounds[label]
+
+    end_main = next(k for k in range(n) if E[k].insn.op == "end")
+    return chip.start_cycles + region(0, end_main)
 
 
 def size_of(e: Emitted, chip) -> int:
@@ -328,7 +452,7 @@ def assemble(out: list, chip: str, entry: int):
         insn = Insn(e.insn.op, (labels[e.target],)) if e.target is not None else e.insn
         e.bytes = encode(insn, chip, e.addr)
         code += e.bytes
-    return bytes(code), labels, hops
+    return bytes(code), labels, hops, hop_target
 
 
 def build(program, chip, trace: bool = False) -> Build:
@@ -340,7 +464,7 @@ def build(program, chip, trace: bool = False) -> Build:
     words = optimise([w for w in sel.words if id(w) in used or w.kind in ("state", "param")], ops, chip)
     out = schedule(ops, chip)
     entry = ENTRY[chip]
-    code, labels, hops = assemble(out, chip, entry)
+    code, labels, hops, hop_target = assemble(out, chip, entry)
     if entry + len(code) > CODE_END[chip]:
         raise DmpError(f"{ir.name} needs {len(code)} bytes of code; the {chip} has "
                        f"{CODE_END[chip] - entry} from the entry point")
@@ -349,4 +473,4 @@ def build(program, chip, trace: bool = False) -> Build:
         if w.kind in ("state", "param", "const"):
             image[w.addr:w.addr + 4] = (w.init & MASK).to_bytes(4, "big")
     image[entry:entry + len(code)] = code
-    return Build(program, ir, chip, entry, image, code, out, words, labels, hops, trace)
+    return Build(program, ir, chip, entry, image, code, out, words, labels, hops, hop_target, trace)

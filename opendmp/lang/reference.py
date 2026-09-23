@@ -98,6 +98,7 @@ class Reference:
     def __init__(self, program, ir: N.ProgramIR):
         self.program = program
         self.schema = [f.type for f in ir.packet]
+        self.fsync_on = "fsync" in ir.uses
         self.src = function_source(program.fn)
         self.state: dict = {}
         self.kinds: dict = {}
@@ -311,8 +312,11 @@ class Reference:
         s = self.sample
         if f == "fsync":
             return R(INT, s.fsync & 1)
+        temp = s.temp
+        if self.fsync_on:                     # EXT_SYNC_SET = 1: FSYNC is the temperature's bit 0
+            temp = (temp & ~1) | (s.fsync & 1)
         raw = {"ax": s.ax, "ay": s.ay, "az": s.az, "gx": s.gx, "gy": s.gy, "gz": s.gz,
-               "temp": s.temp}[f]
+               "temp": temp}[f]
         return R(S16, s32(raw << 16))
 
     # ------------------------------------------------------------------ expressions

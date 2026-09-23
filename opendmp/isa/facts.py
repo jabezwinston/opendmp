@@ -38,6 +38,9 @@ FACTS = [
          "az gx gy gz temp, int16 BE, at 0x0004-0x0011", HW, "Findings 34, 39, probe82b/91"),
     Fact("ram.fsync.icm", ICM, "With EXT_SYNC_SET = 1, bit 0 of the temperature sample (RAM 0x0011) "
          "is the FSYNC level", HW, "Finding 35, probe83"),
+    Fact("ram.fsync.mpu", MPU, "With CONFIG.EXT_SYNC_SET = 1, bit 0 of the temperature sample (RAM "
+         "0x007) is replaced by the FSYNC level (measured: it follows the undriven pin, 0; the MPU "
+         "rig's FSYNC is not wired to the bridge)", HW, "Finding 43, probe105"),
     Fact("ram.fifo.icm", ICM, "The FIFO is DMP RAM 0x3000-0x3fff: every FIFO byte lands there, "
          "filled from 0x3000 after a FIFO reset; code and data must stay below 0x3000", HW,
          "Finding 39, probe91 FIFO"),
