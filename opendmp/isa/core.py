@@ -124,12 +124,16 @@ def length(buf, pc: int, chip, mode: int = 1) -> int:
     return 1
 
 
+F4_OPS = ("jump", "call", "mode4", "branch", "nop.f4", "nop.f440", "int.f4")
+
+
 def next_mode(insn: Insn, chip, mode: int) -> int:
-    """The mode register after `insn`.  Mode bytes act even under a false predicate, and so
-    does DMP3's f4 [HW, probe64], so this holds on every path."""
+    """The mode register after `insn`.  Mode bytes act even under a false predicate, and so does
+    every f4, on both cores: it leaves mode 4 (DMP3 [HW, probe64]; MPU [HW, probe95-97]), in
+    which a byte below 0x80 is a jump, not an ALU op.  So this holds on every path."""
     if insn.op == "fmode":
         return insn.args[0]
-    if chip_name(chip) == ICM and insn.op in ("jump", "call", "mode4"):
+    if insn.op in F4_OPS:
         return 4
     return mode
 
@@ -175,8 +179,8 @@ def decode(buf, pc: int, chip, mode: int = 1) -> tuple[Insn, int]:
         if n == 1:
             return Insn("nop.f4"), 1
         x = raw[1]
-        if x < 0x40:
-            return Insn("branch", (pc + 2 + x,)), 2     # [HW, probe26/27; 6-bit, probe70]
+        if x < 0x40:                                    # signed 6 bits: -32..+31 [HW, probe101]
+            return Insn("branch", (pc + 2 + (x if x < 0x20 else x - 64),)), 2
         if x == 0x40:
             return Insn("nop.f440"), 2
         if x & 0x1F:
@@ -257,9 +261,9 @@ def encode(insn: Insn, chip, pc: int | None = None) -> bytes:
             _chk(isinstance(t, int), f"branch: unresolved target {t!r}")
             _chk(pc is not None, "branch: encoding needs the instruction's own address")
             d = t - (pc + 2)
-            _chk(0 <= d <= 63, f"branch to {t:#06x} from {pc:#06x}: the displacement {d} is "
-                 "outside 0..63 (forward only, 6 bits; f4 40-7f is not a branch)")
-            return bytes([0xF4, d])
+            _chk(-32 <= d <= 31, f"branch to {t:#06x} from {pc:#06x}: the displacement {d} is "
+                 "outside -32..31 (a signed 6-bit field; f4 40-7f is not a branch)")
+            return bytes([0xF4, d & 0x3F])
         if op == "nop.f4":
             return b"\xf4"
         if op == "nop.f440":

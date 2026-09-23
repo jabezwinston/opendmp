@@ -38,8 +38,11 @@
         p0bank  1
         p0page  1
         p1page  2               ; P1 -> param
-        cmp     3,0             ; flags := angle - limit
-        if le0
+        store
+        p2page  1               ; P2 -> work.gy (scratch)
+        fmode   1
+        rsub    3,0             ; F := limit - angle < 0
+        if ge0                  ; (= if nf: da)
         branch  2
         always
         int

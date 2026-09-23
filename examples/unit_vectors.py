@@ -2,7 +2,8 @@
 and the cosine of the angle between them (is the device spinning about the vertical?).
 
 u = v / |v| is computed as v * rsqrt(|v|^2):
-  1. range reduction: double v until |v|^2 lies in [1/4, 1)           a loop, <= 14 trips
+  1. range reduction: double v until |v|^2 lies in [1/4, 1)           a loop, <= 15 trips,
+                                                                    recomputing |v|^2 each trip
   2. Newton for h = 0.5/sqrt(m):  h <- h * (1.5 - 2*m*h^2)            a loop, <= 6 trips,
                                                                     left once converged
   3. u = 2 * v * h
@@ -28,25 +29,33 @@ def unit(x, y, z):
     m = x * x + y * y + z * z            # below 0.75
     if m == 0.0:
         return 0.0, 0.0, 0.0
-    for _ in dmp.loop(14):               # 14 doublings reach the smallest nonzero int16
+    for _ in dmp.loop(15):               # 15 doublings take a 1-LSB sample (x 1/4) to 1/2
         if m >= 0.25:
             break
+        # m = x^2 + y^2 + z^2 < 1/4 here, so each component is below 1/2 (and doubles safely)
+        dmp.assume(x, -0.5, 0.5)
+        dmp.assume(y, -0.5, 0.5)
+        dmp.assume(z, -0.5, 0.5)
         x = x * 2
         y = y * 2
         z = z * 2
-        m = m * 4
-    h = 0.75                             # h = 0.5 / sqrt(m), in (0.5, 1]
+        # recompute m rather than m * 4: for a vector of a few LSB, x * x floors away most of
+        # |v|^2, and scaling that error by 4 per trip would leave |u| up to 12 % off
+        m = dmp.assume(x * x + y * y + z * z, 0.0, 1.0)      # 4 x the last m, which was < 1/4
+    h = 0.75                             # h = 0.5 / sqrt(m): m in [1/4, 1), h in (1/2, 1]
     for _ in dmp.loop(6):
         t = m * h * h
         if abs(0.25 - t) < EPS:
             break
-        h = h * (1.5 - t - t)
-    return 2 * (x * h), 2 * (y * h), 2 * (z * h)
+        h = dmp.assume(h * (1.5 - t - t), 0.25, 1.0)    # from 0.75, Newton dips to 0.28 for m near 1
+    # the components of a unit vector, to Newton's precision
+    return (dmp.assume(2 * (x * h), -1.01, 1.01), dmp.assume(2 * (y * h), -1.01, 1.01),
+            dmp.assume(2 * (z * h), -1.01, 1.01))
 
 
 @dmp.program(rate=100)
 def axes(s):
     gx, gy, gz = unit(s.accel.x * 0.25, s.accel.y * 0.25, s.accel.z * 0.25)
     wx, wy, wz = unit(s.gyro.x * 0.25, s.gyro.y * 0.25, s.gyro.z * 0.25)
-    c = gx * wx + gy * wy + gz * wz
+    c = dmp.assume(gx * wx + gy * wy + gz * wz, -1.02, 1.02)   # two unit vectors
     dmp.emit(gx=gx, gy=gy, gz=gz, wx=wx, wy=wy, wz=wz, cos=c)

@@ -34,7 +34,9 @@ def normalize(q):
     # |q|^2 stays within a hair of 1; interval arithmetic alone allows 0..4 and would warn
     n = dmp.assume(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3], 0.9, 1.1)
     k = 1.5 - 0.5 * n
-    return [q[0] * k, q[1] * k, q[2] * k, q[3] * k]
+    # |q[i]| <= sqrt(n) and sqrt(n) * (1.5 - n/2) peaks at exactly 1 (n = 1): unit components
+    return [dmp.assume(q[0] * k, -1.0, 1.0), dmp.assume(q[1] * k, -1.0, 1.0),
+            dmp.assume(q[2] * k, -1.0, 1.0), dmp.assume(q[3] * k, -1.0, 1.0)]
 
 
 @dmp.program(rate=RATE)

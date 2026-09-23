@@ -1,13 +1,30 @@
 # Examples
 
-Twelve programs, written in the opendmp language (PLAN.md §2). The compiler that builds them
-does not exist yet, so for now they serve as the language's specification and as the
-compiler's acceptance suite. Each must build for both chips, simulate bit-exact against the
-emulator, and run on both rigs.
+Twelve programs, written in the opendmp language (PLAN.md §2). Each one builds for both chips
+(`python -m opendmp build examples/tilt.py`). Its bytes run in the emulator bit-exact against
+the reference semantics (`tests/test_backend.py`), and it runs bit-exact on both bench rigs
+(`python -m opendmp run examples/tilt.py --port /dev/ttyUSB0 --verify`). The main README has
+the code size and cycles of each.
 
-All twelve pass a range check on synthetic motion (rest, rotation, walking, taps, 10 Hz
-vibration, free fall and a saturating shake): no value leaves [-2, 2), and every declared
-range and `dmp.assume` holds.
+All twelve pass `python -m opendmp check` with no range warning: interval analysis proves that
+no value can wrap. Where it cannot see a fact, the program states it with `dmp.assume` and a
+comment giving the reason:
+- `biquad`: the filter's gain, the L1 norm of its impulse response, 1.091;
+- `goertzel`: the resonator's energy;
+- `mahony`: |a × v| ≤ √3;
+- `gyro_quat`, `dmp.quat`: unit quaternion components;
+- `unit_vectors`: the Newton and range-reduction invariants.
+
+`python -m opendmp sim` runs each on synthetic motion (rest, rotation, walking, taps, 10 Hz
+vibration, free fall and a saturating shake). No value wraps, and every assumption holds on
+every pass.
+
+Two examples changed when the checker first ran:
+- `goertzel` now scales its input by 1/256: at 1/128, a full-scale resonant input would push
+  the resonator to 1.28, past its declared range.
+- `unit_vectors` now recomputes |v|² on every doubling trip, and allows 15 trips. Keeping
+  `m * 4` let the floor of a tiny vector's x² grow into a 12 % error in |u|, and 14 trips were
+  one too few for a 1-LSB sample.
 
 | file | algorithm | exercises |
 |---|---|---|
@@ -24,7 +41,7 @@ range and `dmp.assume` holds.
 | `goertzel.py` | single-bin DFT tone detector (10 Hz) | a resonator with a coefficient near 2, a block counter, DC removal |
 | `unit_vectors.py` | exact normalisation via range reduction + Newton | `@dmp.sub`, `dmp.loop` + `break`, early `return`, several return values |
 
-`emu/` is different: it is an **emulator demo** you can run today. `tilt.asm` is PLAN.md §3's
+`emu/` is different: it is an **emulator demo** in assembly. `tilt.asm` is PLAN.md §3's
 hand-compiled tilt filter in opendmp assembly, with its data. `tilt.s` is the same program in
 dmpasm syntax. `tilt.toml` is the run configuration, and `tilt_walk.csv` is generated motion:
 

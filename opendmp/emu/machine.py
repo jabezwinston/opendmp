@@ -20,6 +20,9 @@ from .chips import Chip, get_chip
 from .disasm import disasm
 
 
+UNKNOWN_F = object()      # F after an op whose flag rule is not measured
+
+
 class Unmodelled(Exception):
     """The program did something the emulator has no measured model for."""
 
@@ -342,6 +345,8 @@ class Machine:
         self.last = last
 
     def _cond(self, b: int) -> bool:
+        if self.f is UNKNOWN_F:
+            raise Unmodelled("a predicate reads F after MIN, which is not modelled (probe99)")
         return (not self.f) if b == 0xDA else self.f
 
     # ------------------------------------------------------------------ execution
@@ -389,8 +394,9 @@ class Machine:
                 self.mode = b & 7
             self.pc = pc + 1
             return "cheap"
-        if icm and b == 0xF4:                     # enters mode 4 even when skipped [HW, probe64]
-            self.mode = 4
+        if b == 0xF4:                             # every f4 enters mode 4, even when skipped:
+            self.mode = 4                         # DMP3 [HW, probe64]; the MPU too [HW, probe95-97]
+        if icm and b == 0xF4:
             n = self.length(pc)
             if self.skip or n == 1:
                 self.pc = pc + n
@@ -405,6 +411,12 @@ class Machine:
         # --- executed ---------------------------------------------------------------
         if icm and self.mode == 4 and b < 0x80:   # a branch target with no f4 of its own [HW]
             return self._jump(b, m[pc + 1], pc + 2)
+        if not icm and self.mode == 4 and b < 0x80:
+            # the MPU has DMP3's mode 4: after an f4 a low byte is not an ALU op but a two-byte
+            # jump, whose address mapping is not measured yet (probe97: 0c 20 and 14 20 went to
+            # 0x420, 04 20 did not) [HW]
+            raise Unmodelled(f"MPU byte {b:02x} in mode 4 (after an f4) at {pc:#06x}: a mode-4 jump; "
+                             "set the mode (f0-f7) after a branch")
         self.pc = pc + 1
         if b < 0x80:
             return self._alu(b)
@@ -476,8 +488,8 @@ class Machine:
             if imm >= 0x80:
                 return "cheap"                      # one byte; the next byte executes
             self.pc = pc + 2
-            if imm < 0x40:
-                self.pc = pc + 2 + imm
+            if imm < 0x40:                          # signed 6 bits: -32..+31 [HW, probe101]
+                self.pc = pc + 2 + (imm if imm < 0x20 else imm - 64)
                 return "branch"
             if imm & 0x1F:
                 self.ints += 1
@@ -546,17 +558,17 @@ class Machine:
             key = "mac"
         elif mode in (5, 6, 7):                     # MIN / CMP / AND / XOR [HW, probe70/86]
             a, b, w = self._lanes(a, b)
-            if k == 0:                              # F := a > b; d1 then tests b - a
+            if k == 0:                              # MIN; d1 then tests b - a [HW, probe86]
                 d = b - a
                 if d >= 1 << (w - 1):
-                    r, f = -1, True                 # measured, unexplained (probe86 F, 4 cells)
+                    r = -1                          # measured, unexplained (probe86 F, 4 cells)
                 else:
-                    r, f = min(a, b), d < 0
-                self._flags(f, d)
+                    r = min(a, b)
+                self._flags(UNKNOWN_F, d)           # no simple rule fits 16 cells (probe99)
                 key = "logic"
-            elif k == 1:                            # flags only; d1 then reads zero
-                r, store = a - b, False
-                self._flags(r < 0, 0)
+            elif k == 1:                            # "CMP": a sign test, not a compare, both
+                r, store = a - b, False             # cores: F := a < 0 and b >= 0 (probe98/99,
+                self._flags(a < 0 <= b, 0)          # 56 cells); no store; d1 then reads zero
                 key = "cmp"
             else:                                   # AND / XOR: F untouched, d1 reads zero
                 r = (a & b) if k == 2 else (a ^ b)
@@ -568,8 +580,12 @@ class Machine:
             a, b, _ = self._lanes(a, b)
             if k == 0:
                 r, key = a + b, "add"
-            elif k == 1:
-                r, key = b - a, "add"
+            elif k == 1:                            # B - A as B + (-A), -A wrapped to the lane:
+                w = 16 if mode in (3, 7) else 32    # so A = -2.0 is added, not subtracted, and F
+                neg = -a                            # is the sign of that exact sum (probe100)
+                if neg >= 1 << (w - 1):
+                    neg -= 1 << w
+                r, key = b + neg, "add"
             else:
                 prod = a * b if k == 2 else -(a * b)
                 r, lo, key = prod >> 30, prod & LO30, "mul"

@@ -48,11 +48,16 @@ FACTS = [
     Fact("ram.data_reach", BOTH, "A pointer reaches the data space only: MPU 0x000-0xbff (3 KB, "
          "blocks mod 3), ICM 0x0000-0x0fff", HW, "Findings 24, 35"),
     # --- the flag and predicates --------------------------------------------------------
-    Fact("flag.sign", BOTH, "One flag F = the exact (unwrapped) result < 0; no Z; compares never "
-         "overflow", HW, "Finding 37, probe86 E-H, probe88"),
+    Fact("flag.sign", BOTH, "One flag F; no Z.  ADD: F = A + B < 0 exactly; RSUB: F = B + (-A) < 0 "
+         "exactly with -A wrapped, so the exact sign of B - A unless A = -2.0; MUL: F = A * B < 0",
+         HW, "Finding 37, probe86 E-H, probe88, probe99/100"),
     Fact("flag.test", BOTH, "d1 makes F = (last result == 0)", HW, "Finding 37"),
-    Fact("flag.logic", BOTH, "AND/XOR leave F alone; MIN sets F := a > b; CMP sets F := a - b < 0 "
-         "and stores nothing", HW, "Finding 37, probe70/86"),
+    Fact("flag.logic", BOTH, "f5 op 1 (\"CMP\") stores nothing and tests signs only: F := A < 0 <= B "
+         "(so the compiler compares with RSUB); MIN's F has no simple rule; AND/XOR leave F alone",
+         HW, "probe98/99 (56 cells, both parts)"),
+    Fact("mode4.mpu", MPU, "Every f4 (branch, f4 40, the one-byte form; taken, not taken or "
+         "skipped) leaves mode 4, where a byte below 0x80 is a two-byte jump, not an ALU op; MOV, "
+         "CLR, INC and page loads work there", HW, "probe95-97"),
     Fact("flag.frozen", BOTH, "F does not change while a predicate is armed (except d1, fc cK)",
          HW, "probe67/68, Finding 35"),
     Fact("pred.sticky", BOTH, "d9/da/db stay in force until the next d8-db; d9 = db = IF F, "
@@ -94,7 +99,9 @@ FACTS = [
     Fact("pass.carry.icm", ICM, "Mode 4 survives across passes: start every pass with f1, then d8",
          HW, "probe54b"),
     # --- control flow -----------------------------------------------------------------------
-    Fact("branch.mpu", MPU, "f4 d, d < 0x40: forward branch of d bytes after the instruction; "
+    Fact("branch.mpu", MPU, "f4 d, d < 0x40: a branch by d as a signed 6-bit field (0x00-0x1f "
+         "forward 0..31, 0x20-0x3f back 32..1) after the instruction [HW, probe101]; every f4 "
+         "enters mode 4, even when skipped [HW, probe95-97]; "
          "f4 40 does nothing; f4 41-7f (low five bits set) raise DMP_INT; f4 >= 0x80 is one byte",
          HW, "probe26/27/69/70"),
     Fact("jump.icm", ICM, "f4 hi lo: jump (hi bit 6 clear) or call to (hi << 8 | lo) & 0x3fff; "

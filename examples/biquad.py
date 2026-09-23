@@ -7,7 +7,9 @@ bilinear transform), so a different cutoff is a one-line change.  Direct Form I:
 
 is a five-term dot product per axis: one multiply-accumulate run on the MPU.  The input is
 halved first because a Butterworth low-pass overshoots a full-scale step, and the output
-would wrap at 2 g.
+would wrap at 2 g.  The output bound is the impulse response's L1 norm, 1.091, times the
+input's peak: interval arithmetic cannot see that (it adds |A1| + |A2| > 1), so the helper
+states it with dmp.assume, and the simulator checks it.
 
 Packet: the filtered x, y, z in units of g/2 (q30), 12 B.
 Exercises: compile-time filter design, a helper that updates a state list in place (it is
@@ -33,7 +35,7 @@ A2 = (1 - _alpha) / _a0                    #  0.8008
 
 def biquad(x, z):
     """One step of the filter; z = [x1, x2, y1, y2] is this axis's history."""
-    y = B0 * x + B1 * z[0] + B2 * z[1] - A1 * z[2] - A2 * z[3]
+    y = dmp.assume(B0 * x + B1 * z[0] + B2 * z[1] - A1 * z[2] - A2 * z[3], -1.1, 1.1)
     z[1] = z[0]
     z[0] = x
     z[3] = z[2]

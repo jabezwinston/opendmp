@@ -20,7 +20,20 @@ is shipped or needed** (see B1 below).
     - `facts.py`;
     - **B1 and B2 measured**. A program runs with **no vendor image** on both parts, and the
       clobber map is known. On the ICM the FIFO is DMP RAM 0x3000–0x3fff.
-- **Next:** Phase 2, the front end.
+  - **Phase 2, the front end** (`opendmp/lang/`, `opendmp/ir/`):
+    - the Python subset, lowered to a typed IR, with located errors that give a hint;
+    - two executable semantics that agree bit for bit on all 12 examples: the reference
+      (evaluating the source) and the IR interpreter;
+    - range analysis. All 12 examples are proven free of wraps.
+    - The CLI is `python -m opendmp check | sim | ir`.
+  - **Phase 3, the backends** (`opendmp/backend/`): all 12 examples build for both chips, and
+    their bytes in the emulator equal the reference on every pass, 10,000 random ones included.
+  - **Phase 4, the runtime and silicon** (`opendmp/host/`): vendor-free load and run, and trace
+    builds replayed in the emulator. **All 12 examples are bit-exact on both rigs.** The first
+    silicon runs found four ISA behaviours that the manual and the emulator had wrong (ISA2.md
+    Finding 40, §7); they are measured, modelled and compiled around.
+- **Next:** Phase 5: optimisation (layout, cycles), ICM calls for `@dmp.sub`, and the
+  tutorial.
 
 ## 1. Decisions (2026-09-23)
 
@@ -76,6 +89,9 @@ $ opendmp sim   tilt.py --sensors walk.csv           # the cycle-accurate emulat
   enforced by the host runtime, which refuses writes outside it.
 - **The literal picks the type.** `0.0` is Q30 and `0` is `Int` (a raw 32-bit counter, so
   `n += 1` is one `INC`). `dmp.bits(0xffff0000)` is `Bits` (`&`, `^`, shifts).
+- **A `+`/`-` expression is exact.** It is summed in full precision (products included) and
+  wraps once, at the end, so an intermediate that would pass 2 does no harm if the result
+  fits (§4, "reference semantics").
 - **Module-level names are compile-time constants.** They can be any Python, including `math`.
   Only the value that reaches the DMP has to lie in [-2, 2): `GYRO_DT = math.radians(1000) /
   RATE` is fine even though its factors are not.
@@ -112,8 +128,9 @@ check on synthetic motion.
 
 `opendmp build` prints the listing and a summary, and writes `build/tilt.{asm,lst,bin,json}`.
 The listing below is a **format mock-up** for the program above, hand-compiled by the rules in
-§6. Its bytes were checked by assembling the `.asm` with opendmp's assembler and with
-`InvensenseDMP/tools/dmpasm.py` (45 bytes, identical). They also **run in the emulator** as `examples/emu/tilt.toml`, where the
+§6 (`opendmp build --list` prints the real one, in the same columns). Its compare was a `cmp`
+until Finding 40 showed that the `f5` compare tests signs only; it is now an RSUB. Its bytes were checked by assembling the `.asm` with opendmp's assembler and with
+`InvensenseDMP/tools/dmpasm.py` (47 bytes, identical). They also **run in the emulator** as `examples/emu/tilt.toml`, where the
 filter tracks the generated motion and the times below are its measured cycle counts.
 
 ```
@@ -152,21 +169,23 @@ filter tracks the generated motion and the times below are its measured cycle co
         ; tilt.py:11  if angle > limit:
 0421    b1 81     p0 -> 0x110        P0 = work                                    10  1.22
 0423    92        p1page 2           P1 = param {limit}                            5  0.61
-0424    f5        fmode 5                                                          5  0.61
-0425    61        cmp 3,0            F := angle - limit < 0 (exact: no wrap)      17  2.07
-0426    d9        if f                                                             5  0.61
-0427    f4 02     branch 0x042b      angle <= limit: skip the irq                 15  1.83
-0429    d8        always             angle > limit: fall through                   5  0.61
+0424    dc        store              route -> RAM                                  5  0.61
+0425    a1        p2page 1           P2 = work.gy, a scratch by now                5  0.61
+0426    f1        fmode 1                                                          5  0.61
+0427    61        rsub 3,0           gy := limit - angle; F := it < 0 (exact)     28  3.42
+0428    da        if nf                                                            5  0.61
+0429    f4 02     branch 0x042d      angle <= limit: skip the irq                 15  1.83
+042b    d8        always             angle > limit: fall through                   5  0.61
         ; tilt.py:12  dmp.irq()
-042a    fe        int                raise DMP_INT                                 5  0.61
-042b    d8        always             join                                          5  0.61
-042c    ff        end                end of pass                                   5  0.61
+042c    fe        int                raise DMP_INT                                 5  0.61
+042d    d8        always             join                                          5  0.61
+042e    ff        end                end of pass                                   5  0.61
 
 ; data   0x100 const  GYRO_DT 059652bd  1.0 40000000  K 3eb851ec  0.02 0147ae14
 ;        0x110 work   gy  ax  t  angle(state, init 00000000)
 ;        0x120 param  limit 10000000
 ; packet 6 B   angle q30 [0:4]   accel_z i16 [4:6]    (generated parser: build/tilt.json)
-; pass   45 B: 624 cycles = 76.1 us after the tick (629 when it interrupts), 1.5 % of 5000 us
+; pass   47 B: 645 cycles = 78.7 us after the tick (650 when it interrupts), 1.6 % of 5000 us
 ```
 
 The `.asm` has the same content in opendmp assembly (`opendmp.isa`), which is
@@ -194,11 +213,36 @@ pointers select, and the data (`.dw`), so it can be read, edited and reassembled
 | `dmp.emit`, `dmp.irq`, `return` (ends the pass), `dmp.assume` | yes | yes |
 | divide by a variable, `sqrt`, `**` (other than `x*x`), runtime list index, recursion, emit under a condition, `<<` on Q30 | **error**, with a hint (`dmp.rsqrt` does a Newton step; tables need constant indices) | same |
 
-**Reference semantics.** `tilt.simulate(samples)` runs the source through a plain-Python
-rewrite of its AST over the Q30 model: wrapping add, a multiply that floors, signed min, and
-the **exact-sign flag** (§6.4). The rewrite shares only the parser with the compiler, so it is
-an independent oracle for the whole backend. The emulator is the second oracle, working from
-the bytes.
+**Reference semantics** (settled in Phase 2; `opendmp/lang/reference.py`). `tilt.simulate(samples)`
+evaluates the source directly over the Q30 model. The rules, which the compiled code must match
+bit for bit:
+
+- **A `+`/`-` expression is one exact Sum.** Its terms can be values, integer multiples
+  (`2*x`) and two-factor products (`a*b`, `K*x`, `x/C`). They are added in full precision
+  (products in Q60), floored once and wrapped once. That is what one multiply-accumulate run
+  computes, so `K*a + (1-K)*b` has one exact meaning, and parentheses inside a sum change
+  nothing. A product's factors are values: an inner product or sum is floored and wrapped
+  first. A minus sign on a factor moves to the term. A lone product is a one-term sum.
+- **Constants** are literals, module-level names, `range()` indices, helper arguments that are
+  constants, and expressions of these. They are folded in Python as written, then rounded to
+  the nearest Q30 when they meet a DMP value; outside [-2, 2) is an error. **Assigning to a
+  local always makes a DMP value** (`h = 0.75` is a word, not a constant).
+- **The literal picks the type**: `0.0` is Q30, `0` is Int, `dmp.bits()` is Bits. A variable
+  keeps its type, so `x = 1` into a Q30 variable is an error (write `1.0`).
+- Compares, `min`, `max` and `clamp` are exact. `abs(-2.0)` wraps to -2.0. Int arithmetic wraps
+  at 32 bits.
+- **Lists** exist only at compile time: every index is a constant, so each element is its own
+  word. A named list (`y = z[0]`, or a helper argument) is shared; a list display or a
+  helper's result is a copy.
+- `and`/`or` evaluate every operand (a helper call in one runs regardless), unless a constant
+  operand decides the result.
+
+The reference shares only the reading of the source with the compiler: finding the function,
+what a module-level name means, and constant folding (`lang/common.py`). The arithmetic,
+flattening, control flow, inlining and lists are implemented twice, once in the reference and
+once in lowering plus `ir/interp.py`. The two agree bit for bit on every example. A deliberately
+broken IR interpreter (a floor per product) is caught on every example tried. The emulator
+running the compiled bytes will be the third oracle.
 
 ## 5. Architecture
 
@@ -218,7 +262,11 @@ tilt.py ─ast─> front end ──> IR (typed values, storage classes, structur
 
 ```
 opendmp/
-  __init__.py      the whole user API (program, state, param, emit, irq, clamp, connect, ...)
+  __init__.py      the whole user API, re-exported from api.py              [done]
+  api.py           program, state, param, emit, irq, clamp, assume, loop, sub, bits; Program
+                     (.ir, .check(), .simulate(samples, engine, params))
+  quat.py          dmp.quat: gravity, rate_step, normalize, written in the language
+  sim.py           SimResult: packets, interrupts, decoded fields, actual wraps, failed assumptions
   q30.py           the number model                                        [done]
   emu/             the cycle-accurate emulator, both chips                 [done, §8]
     machine.py       state, step, pass; every unmeasured behaviour a Model switch
@@ -232,11 +280,22 @@ opendmp/
     core.py          Insn, decode/encode (inverses, checked on 13 vendor images), cost keys
     asm.py           opendmp assembly: .chip/.entry/.org/.dw/labels, mode tracking, disassembly
     facts.py         every machine behaviour relied on, with status and evidence (§7)
-  lang/            parse, check (subset and errors with a caret and a hint), lower to IR, reference rewrite
-  ir/              nodes, interp, range analysis, passes
+  lang/            the front end                                           [done]
+    errors.py        DmpError / warnings: file:line:col, the line, a caret, a hint
+    source.py        a function's AST and the names it sees (module globals, closures)
+    common.py        what names mean, constant folding (shared by the two semantics)
+    lower.py         AST -> IR: types, folding, exact Sums, inlining, @dmp.sub, lists, control flow
+    reference.py     the reference semantics: evaluates the source; counts wraps, failed assumes
+  ir/              the IR                                                  [done]
+    nodes.py         Var (state/param/temp/arg), Const Load Sensor Sum(Term, Prod) MinMax Abs
+                     Select BitOp Shift Assume; Cmp BoolOp Not; Assign If Block Loop Break Emit
+                     Irq Check CallSub; SubIR, ProgramIR (packet schema)
+    interp.py        the IR, executed
+    ranges.py        interval analysis: where a value can wrap, with the fix; per-node intervals
+    show.py          the IR as text
   backend/         layout, select, sched, flow, emit (asm/lst/bin/json)
   host/            bridge.py (the ESP32 protocol, including W), rig.py, packets.py
-  cli.py           python -m opendmp dis | asm | facts   [done]; build | sim | run | check to come
+  cli.py           python -m opendmp check | sim | ir | dis | asm | facts   [done]; build | run to come
 examples/          12 programs (examples/README.md); examples/emu/ = a runnable emulator demo
 tests/             37 tests: hardware-transcribed ISA vectors, cycle counts, scheduling, the CLI
 ```
@@ -249,7 +308,7 @@ raises `Unmodelled` for anything with no measured meaning.
 
 ## 6. The hard parts
 
-### 6.1 Chip profiles (measured: ISA2.md Findings 37/38)
+### 6.1 Chip profiles (measured: ISA2.md Findings 37–40)
 
 | | mpu6050 (mantis) | icm20948 (DMP3) |
 |---|---|---|
@@ -257,8 +316,8 @@ raises `Unmodelled` for anything with no measured meaning.
 | code | entry 0x0400, up to 0x0BFF (3 KB of memory in all) | entry 0x1000, **up to 0x2FFF** (8 KB): 0x3000–0x3FFF is the FIFO |
 | hardware-written RAM | **0x000–0x00D only**: ax ay az temp gx gy gz as int16 BE, every pass, only while the DMP runs (B2). 0x00E–0x00F are free | **0x0000–0x0011**: 0–3 cleared, then ax ay az gx gy gz temp (FSYNC is temp bit 0); **plus every FIFO byte, into 0x3000–0x3FFF** (B2) |
 | boot | **no vendor image** (B1): device reset (it keeps DMP memory), minimal registers, zero all memory, load, `DMP_CFG_1/2` = entry | the same (B1); HW_FIX_DISABLE / SINGLE_FIFO_PRIORITY_SEL not needed |
-| flag | **one flag F on both chips**: exact result < 0; `d1` makes it result == 0; `d9` IF F, `da` IF ¬F. **No Z flag** | same |
-| control flow | forward branch of **0–63 B** (`f4 41`–`7f` is the interrupt) | 16-bit jump and call (4 deep), `e0`, loops; mode-4 hygiene |
+| flag | **one flag F on both chips**; `d1` makes it result == 0; `d9` IF F, `da` IF ¬F; **no Z**. ADD/RSUB/MUL set the exact sign (RSUB: unless A = −2.0); **`f5` op 1 only tests signs** (Finding 40) | same |
+| control flow | **signed 6-bit branch: −32..+31 B** (`f4 41`–`7f` is the interrupt); **every `f4` leaves mode 4**, where a low byte is a jump (Finding 40) | 16-bit jump and call (4 deep), `e0`, loops; mode-4 hygiene |
 | multiply-accumulate | `f0`; **any destination move restarts the sum** | `f0` too; **only an op&4 pre-advance restarts it** |
 | `f2`/`f3` | **16-bit lanes, not just store widths**: `f3` computes on sign-extended low halves (a MUL there is tiny), `f2` on high halves; the same for `f6`/`f7` | same |
 | interrupt | `fe` | `e2` |
@@ -289,29 +348,35 @@ nothing arithmetic may run under `f2`/`f3` unless a 16-bit lane op is intended.
 | IR | selection |
 |---|---|
 | `a + b`, `a * b`, `-(a*b)` | ADD / MUL / NMUL; either operand may take either side |
-| `a - b` | RSUB (B − A) with `b` in the A slot; `fc` + RSUB when the layout forces it |
-| `Σ aᵢ·bᵢ` | `f0` MAC run. It starts fresh on the MPU when the destination moves (a new word or page) and on the ICM when its first op pre-advances (`op&4`); otherwise open with an `f1` MUL |
-| copy, emit | MOV when the source is on P0 (18 cycles on the MPU), otherwise ADD with 0.0 (28) |
+| `a - b` | RSUB (B − A) with `b` in the A slot |
+| any `+`/`-` expression with a product, or more than two terms | one `f0` MAC run: products as MAC ops, a plain term `t` as `t × 1.0`. It starts fresh on the MPU when the destination has moved (P2 page reload, `d0`, or the first op's pre-advance) and on the ICM when its first op pre-advances (so the ICM wants MAC destinations at odd words, and the layout puts them there) |
+| copy, emit | MOV from P0 (18 cycles on the MPU); an int16 sample emitted as `f2`/`f3` MOV straight from the sample page |
 | `s.accel.x`, `s.gyro.y` | `de`, then `f2` MOV or MOVX: the exact int16 lands in the upper half with a zero lower half |
 | 16-bit data | a lane op under `f2`/`f3` is cheaper (22 / 52 cycles on the MPU) but computes on half-words |
 | `2*a`, `4*a` | `a + a` with P0 and P1 on the same page |
-| `min`, `max`, `abs`, `clamp` | `f5` MIN (beware: MIN returns −1 when `b − a` overflows positively); negation; compare-and-select |
+| `min`, `max`, `abs`, `clamp` | compare-and-select: MOV, compare, skip the second MOV (MIN's flag has no simple rule, and its `b − a` overflows); `abs` negates with NMUL by 1.0 |
 | `a & b`, `a ^ b` (Bits) | `f5` AND / XOR (they leave F alone) |
 | `n += 1` (Int) | INC |
+| `a < b` and friends | RSUB into a scratch word (the `f5` "compare" only tests signs). Where range analysis says the subtrahend can be exactly −2.0, a guard RSUB against −2.0 + 1 lsb decides that case first. `==`/`!=`: RSUB then `d1`, with the operand that cannot be −2.0 as A, or the XOR of both against 0 |
+| `for _ in dmp.loop(N)` | a real loop on both chips: a counter from N−1, DEC, branch back while not negative |
 
 ### 6.4 Conditions and control flow
 
 Predicates are **sticky**, and **F freezes while a predicate is armed**, on both chips. So the
 compiler computes every condition under `d8` and ends every conditional region with `d8`.
 
-- **One lowering for both chips.** F is the sign of the *exact* result, so `cmp a,b` (F :=
-  a − b < 0) never overflows. `a < b` is `cmp a,b; if F`, `a >= b` is `if ¬F`, and `a > b` and
-  `a <= b` swap the operands. `==` and `!=` use `d1` after an RSUB. There is no need for the
-  old "compare halves" trick.
+- **One lowering for both chips.** `a < b` is RSUB with `b` as A into a scratch word (F :=
+  a − b < 0, exact), then `if F`/`if ¬F`; the others swap operands or negate. The exception is
+  a subtrahend of exactly −2.0, which RSUB adds instead of subtracting (it wraps −A), and range
+  analysis says where to guard it (§6.3). **Do not use the `f5` "compare"**: it tests signs
+  only (Finding 40).
+- **Every `f4` leaves mode 4 on both chips**, where a low byte is a jump: after any branch,
+  taken or not, the next ALU op sets its mode first. MOV, CLR, INC and page loads need not.
 - **MPU.** A branch-skip (`d9 f4 k d8 <then> d8`) nests naturally, because the body runs with no
-  predicate armed. A body longer than 63 B uses predication when it holds no inner condition,
-  and otherwise a trampoline (`f4 02` over an `f4 3f` hop). A taken branch costs 15 cycles;
-  the bytes it jumps over cost nothing.
+  predicate armed. The branch reaches **−32..+31 bytes**; farther targets go through hops (a
+  branch the fall-through steps over with `f4 02`), shared by every far branch to the same
+  target, forward and backward. A taken branch costs 15 cycles; the bytes it jumps over cost
+  nothing.
 - **ICM.** After every `jump`/`call` (taken, not taken or skipped), the compiler inserts
   `d8 f1` at the target and on the fall-through. A loop's DEC always runs under `d8`, and the
   static call depth must be ≤ 4. `Int` comparisons with 0..63 use `fc cK Y`.
@@ -323,10 +388,25 @@ compiler computes every condition under `d8` and ends every conditional region w
 - **Pass time is exact.** Worst-path cycles through `if`/`else` (ICM loops need a bound) plus
   the start latency, from the measured table, then compared with the sample period. Tick stalls
   only matter for passes that overrun the period.
-- **Range analysis exploits the hardware.** Add/sub chains are exact modulo 2³², so an
-  intermediate wrap is harmless when the final value fits. Compares cannot overflow at all.
-  The analysis therefore warns only where a possibly-wrapped value reaches a multiply, a store,
-  an emit or MIN, and it names the fix.
+- **Range analysis exploits the hardware** (`ir/ranges.py`, done). A Sum is exact and wraps once,
+  and compares cannot overflow. So the only places a program can wrap are a Sum's result and
+  `abs(-2.0)`. A warning names the place, the interval, and where the wrapped value goes: a
+  multiply, a store, an emit, a compare, min/max. It also names the fix: declare a range,
+  scale down, or `dmp.assume`.
+  - **States without a declared range are inferred.** The pass is run to a fixpoint: widened
+    to the full range if it does not settle, then narrowed, so a clamped state comes back.
+  - **A declared range is an assumption, checked where the state is stored.**
+  - **A branch on `v < c` narrows `v`.**
+  - **`dmp.assume` states what interval arithmetic cannot see**, and the simulator checks every
+    assumption on every pass. Examples: a stable filter's gain (the impulse response's L1
+    norm), a resonator's energy, |q| = 1, a Newton invariant.
+
+  Writing the examples against it found real problems:
+  - `goertzel` could reach 1.28 on a full-scale resonant input, so its scale was halved.
+  - `unit_vectors` lost 12 % of |v| on tiny vectors: it kept `m*4` instead of recomputing
+    |v|², and 14 doublings were one too few.
+
+  The per-node intervals are kept for the backend. For one: can MIN's `b − a` overflow?
 
 ## 7. ISA facts the compiler depends on, and the bench work behind them
 
@@ -347,6 +427,7 @@ their probes) are the executable form of the same table.
 | new | the flags | both | **one exact-sign F, no Z**; AND/XOR leave F alone; MIN sets F := a > b; `d1` tests the last adder result (probe86 E–H, probe88) |
 | new | `f2`/`f3`/`f6`/`f7` | both | **16-bit lanes** (probe86 A/E/F, probe88) |
 | new | timing | both | **cycle counts, clocks, start latency, tick stalls** (probe90, with the bridge's new `W` command) |
+| new | control flow and compares, found by the first silicon runs | both | **every `f4` leaves mode 4** on the MPU too; the MPU branch is **signed 6-bit**; the `f5` "compare" **tests signs only**; RSUB's F is exact except A = −2.0; MOV/CLR/INC under every mode as modelled (probes 92–101, Finding 40) |
 
 ## 8. How it is verified
 
@@ -357,16 +438,27 @@ their probes) are the executable form of the same table.
    probe41's pass rates at all five sample rates, including the non-monotonic 500 Hz dip.
 2. **Unit tests** transcribed from the recorded probe results (probes 7/9, 32, 35, 47, 51, 53,
    67–70, 74, 83b, 86, 88, 90, 91), plus cycle sums and scheduling.
-3. **The ISA tables.** Every byte value, in every mode and with every operand tail, decodes
+3. **The front end.** Every example lowers with no range warning. The reference and the IR
+   interpreter agree bit for bit on every example, over every kind of synthetic motion, with
+   no wrap and no failed assumption. Hand-computed words cover the rules where a plausible
+   alternative gives different bits: one floor per sum, exact integer multiples, wrapping,
+   typing, lists, control flow, helpers and subs. A suite of 40 refused constructs checks each
+   message, hint and caret.
+4. **The ISA tables.** Every byte value, in every mode and with every operand tail, decodes
    and re-encodes to itself. All 13 vendor images (about 45,000 instructions) disassemble to
    text that reassembles byte for byte. The listing's cycle class equals the emulator's for
    every instruction the emulator executes.
-4. **Differential testing** (to come). For every example and test program, the reference model
+5. **Differential testing.** Every example, on both chips, emulated from its bytes against the
+   reference on all kinds of synthetic motion; tilt on 10,000 random full-scale samples. For every example and test program, the reference model
    (AST rewrite) and the emulator (compiled bytes) must agree bit for bit.
-5. **Listing self-check** (to come). Decoding the emitted bytes must reproduce the intended
+6. **Listing self-check.** The `.asm` a build writes reassembles to the same bytes (tests). Decoding the emitted bytes must reproduce the intended
    instruction stream, and the `.asm` must reassemble to identical bytes.
-6. **Silicon** (to come). A *trace build* also emits each pass's raw sample words. The emulator
-   replays them and must match the rig's packets bit for bit.
+7. **Silicon.** `opendmp run --verify` loads a *trace build* (each packet starts with the pass's
+   raw sample words), streams the FIFO, and replays the samples through the same bytes in the
+   emulator and through the reference. **All 12 examples are bit-exact on both rigs**: every
+   packet, every interrupt count, about 3,700 passes in all. The first runs were not. The four
+   behaviours behind the misses were isolated on the rigs with probes 92–101 and are recorded
+   as Finding 40.
 
 ## 9. Phases and milestones
 
@@ -374,10 +466,10 @@ their probes) are the executable form of the same table.
 |---|---|---|
 | **1 Emulator** | Q30 model; machine for both chips; pass loop, FIFO, INT; cycle model; file I/O; B3–B7 | **done** 2026-09-23 |
 | **0 Ground truth** | ISA tables, encoder, decoder and `dis` for both chips; `facts.py`; **B1, B2** on both rigs | **done** 2026-09-23 (probe91, Finding 39) |
-| **2 Front end** | ast subset, errors, IR, reference rewrite, range analysis | next. Examples parse and simulate; a rejected-construct suite gives the documented messages |
-| **3 Backends** | layout, selection, scheduler, MPU and ICM control flow, `.lst`/`.asm`/`.bin`/`.json` | **M1 hello-FIFO** and `tilt` build for both chips; emulator equals reference on 10k inputs |
-| **4 Runtime and silicon** | `host/` (bridge incl. `W`, whole-program init, params, state readback, packet stream), trace builds | **M2**: `tilt` bit-exact against the emulator on both rigs |
-| **5 Depth and polish** | nested control flow and trampolines, ICM loops and `@dmp.sub`, the standard library, the 12 examples on both rigs, tutorial and language reference | **M3/M4** |
+| **2 Front end** | ast subset, errors, IR, reference semantics, range analysis | **done** 2026-09-23: the examples parse, simulate (two engines, bit-exact) and range-check clean; 40 refused constructs give their documented messages |
+| **3 Backends** | layout, selection, scheduler, MPU and ICM control flow, `.lst`/`.asm`/`.bin`/`.json` | **done** 2026-09-23: M1 met; all 12 examples build for both chips, emulator = reference |
+| **4 Runtime and silicon** | `host/` (bridge, whole-program init, params, packet stream), trace builds | **done** 2026-09-23: M2 met, and more: **all 12 examples bit-exact on both rigs** |
+| **5 Depth and polish** | a layout that minimises pointer loads, MIN where it is safe, ICM `call` for `@dmp.sub`, state readback and live param writes in the runtime, tutorial and language reference | next |
 
 ## 10. Risks
 
@@ -408,7 +500,8 @@ mantis ISA, add later); the 3050 lineage; an optimal (ILP) layout.
 
 1. `dmpasm.py` accepts `branch 0x40`–`0x7f`, but the displacement is 6 bits: `f4 41`–`7f`
    raises DMP_INT and `f4 40` does nothing. So `branch 65` silently assembles an interrupt.
-   Manual §1.6, §3.6 and §7.1 still say "7-bit, ≤ 127".
+   Manual §1.6, §3.6 and §7.1 still say "7-bit, ≤ 127". Worse, it is signed (item 7): `branch 32`
+   and above go backwards.
 2. Manual §2.9 says there is no AND/XOR and no compare other than `== 0`/MIN. This has been
    stale since Finding 29.
 3. `dmpasm.py` has no mantis mnemonic for `de` (clear in place).
@@ -426,3 +519,8 @@ mantis ISA, add later); the 3050 lineage; an optimal (ILP) layout.
    `if f`/`if nf`), `mov16` (MOVX), the ALU op under `f0` spelled `add` (it is a MAC), `disable`
    (end of pass). opendmp's assembler uses the corrected names and accepts `disable`/`mov16` as
    aliases. The two syntaxes produce identical bytes for `examples/emu/tilt`.
+7. **Superseded by Finding 40** (the manual is not yet rewritten): the MPU branch is signed
+   (−32..+31), not "forward 0..63" (dmpasm accepts 0..0x7f); every `f4` leaves mode 4 on the
+   MPU too, and mode-4 low bytes are jumps (Finding 33's "no jump" is wrong for them); the
+   `f5` op 1 "compare" tests signs only (Finding 37's "F := a − b < 0" rests on opposite-sign
+   cells).

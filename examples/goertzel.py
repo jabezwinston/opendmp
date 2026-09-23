@@ -7,9 +7,11 @@ Goertzel is one DFT bin for the price of one multiply-accumulate per sample.  It
 standard way to watch for a known frequency (a motor's imbalance, a structural resonance)
 without an FFT.  Here: 10 Hz, in blocks of 40 samples at 200 Hz (bin k = 2 exactly).
 
-In Q30, scaling is the whole game.  On-bin, the resonator grows to about N / (2 sin w) times
-the input amplitude.  So the input is scaled by 1/128, which keeps 1 g of vibration peaking
-near 0.5, and the power is computed from halved states.
+In Q30, scaling is the whole game.  On-bin, the resonator grows to about N / (2 sin w) = 65
+times the input amplitude.  So the input is scaled by 1/256: the worst resonant input the
+sensor can deliver (|x - mean| up to 2 g) keeps the states below 0.64.  At 1/128 that input
+would reach 1.28 and break the states' declared range.  Interval arithmetic cannot bound a
+resonator, so the step says so with dmp.assume.  The power is computed from halved states.
 
 Packet: the last block's power / 4 (q30), 4 B.
 Exercises: a resonator (an IIR coefficient close to 2), a block counter with a periodic reset,
@@ -23,7 +25,7 @@ RATE = 200
 N = 40                                  # block length
 F = 10.0                                # Hz
 C = 2 * math.cos(2 * math.pi * F / RATE)   # 1.902
-SCALE = 1 / 128
+SCALE = 1 / 256
 DC = 1 / 64                             # DC-blocker weight
 
 
@@ -37,7 +39,7 @@ def goertzel(s):
 
     x = s.accel.z
     mean = (1 - DC) * mean + DC * x
-    s0 = SCALE * x - SCALE * mean + C * s1 - s2
+    s0 = dmp.assume(SCALE * x - SCALE * mean + C * s1 - s2, -1.0, 1.0)
     s2 = s1
     s1 = s0
     n += 1

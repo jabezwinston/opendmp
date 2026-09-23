@@ -24,8 +24,8 @@ import re
 from dataclasses import dataclass, field
 
 from ..q30 import parse_word
-from .core import ALU_OPS, FAMILY_MODES, ICM, MPU, EncodeError, Insn, chip_name, decode, encode, \
-    length, next_mode  # noqa: F401 (length is re-exported)
+from .core import ALU_OPS, F4_OPS, FAMILY_MODES, ICM, MPU, EncodeError, Insn, chip_name, decode, \
+    encode, length, next_mode  # noqa: F401 (length is re-exported)
 
 DEFAULT_ENTRY = {MPU: 0x0400, ICM: 0x1000}
 MEM_SIZE = {MPU: 0xC00, ICM: 0x4000}
@@ -202,7 +202,7 @@ def assemble(text: str, chip=None) -> Program:
             if addr != asserted and (addr in arriving or addr in backward or addr in calls):
                 ways = set(arriving.get(addr, ())) | {mode}
                 if addr in backward:
-                    ways.add(4 if chip == ICM else None)
+                    ways.add(4)
                 if addr in calls:
                     ways.add(None)
                 mode = ways.pop() if len(ways) == 1 else None
@@ -216,11 +216,9 @@ def assemble(text: str, chip=None) -> Program:
             code = encode(insn, chip, addr)
             prog.lines.append(Line(addr, insn, code, lineno, mode, insn.text()))
             after = next_mode(insn, chip, mode) if mode is not None else \
-                (insn.args[0] if insn.op == "fmode" else
-                 4 if chip == ICM and insn.op in ("jump", "call", "mode4") else None)
+                (insn.args[0] if insn.op == "fmode" else 4 if insn.op in F4_OPS else None)
             if insn.op in _TARGETED and insn.args[0] > addr:
-                arriving.setdefault(insn.args[0], set()).add(
-                    4 if chip == ICM else mode)
+                arriving.setdefault(insn.args[0], set()).add(4)      # every f4 leaves mode 4
             mode = after
         except (AsmError, EncodeError) as e:
             raise AsmError(f"line {lineno}: {e}") from None
@@ -244,9 +242,9 @@ def _check_mode(insn: Insn, chip: str, mode: int | None):
         if mode is None:
             raise AsmError(f"{insn.text()}: the mode register is unknown here (at the entry, or "
                            "at a label reached with different modes); set it with fmode first")
-        if chip == ICM and mode == 4:
-            raise AsmError(f"{insn.text()} in mode 4: a byte below 0x80 is a jump target here; "
-                           "end mode 4 with an fmode first")
+        if mode == 4:
+            raise AsmError(f"{insn.text()} in mode 4: after an f4 a byte below 0x80 is a jump, not "
+                           "an ALU op; end mode 4 with an fmode first")
         if mode not in FAMILY_MODES[fam]:
             need = {"mac": "f0", "arith": "f1-f3", "logic": "f5-f7"}[fam]
             raise AsmError(f"{insn.op} needs mode {need}, but fmode {mode} is in force")

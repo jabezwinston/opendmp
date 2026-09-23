@@ -62,8 +62,8 @@ def test_cost_key_matches_the_emulator(chip):
 def test_tilt_asm_equals_dmpasm_tilt_s():
     ex = HERE.parent / "examples/emu"
     prog = assemble((ex / "tilt.asm").read_text())
-    assert len(prog.code()) == 45
-    assert prog.symbols == {"const": 0x100, "work": 0x110, "param": 0x120, "join": 0x42B}
+    assert len(prog.code()) == 47
+    assert prog.symbols == {"const": 0x100, "work": 0x110, "param": 0x120, "join": 0x42D}
     assert prog.image()[0x120:0x124] == bytes.fromhex("10000000")
     if not (RE_REPO / "tools/dmpasm.py").exists():
         pytest.skip("InvensenseDMP not present")
@@ -80,8 +80,8 @@ def asm(body, chip="mpu6050"):
     ("fmode 1\nmin 0,1", "min needs mode f5-f7"),
     ("fmode 5\nadd 0,1", "add needs mode f1-f3"),
     ("fmode 1\nmac 0,1", "mac needs mode f0"),
-    ("fmode 1\nbranch far\n.org 0x500\nfar: end", "outside 0..63"),
-    ("back: fmode 1\nbranch back", "outside 0..63"),
+    ("fmode 1\nbranch far\n.org 0x500\nfar: end", "outside -32..31"),
+    ("fmode 1\nbranch far\n.org 0x423\nfar: end", "outside -32..31"),
     ("fmode 1\nbranch nowhere", "undefined label"),
     ("fmode 4", "fmode takes"),
     ("fmode 1\nmov 4", "k must be 0..3"),
@@ -117,13 +117,16 @@ def test_assembler_accepts_well_formed_control_flow():
         always
         dec
         if nf
-        branch done          ; forward, mode carried
+        branch done          ; every f4 leaves mode 4 (probe95-97)
         fmode 1
         add 0,1
 done:   always
+        fmode 1
         add 1,1
         end""")
     assert p.code()[:6] == bytes.fromhex("f1d8f9daf402")
+    with pytest.raises(AsmError, match="mode 4"):
+        asm("fmode 1\nbranch next\nnext: add 0,1")          # the MPU's f4 leaves mode 4 too
     q = asm("""
         fmode 1
 loop:   always
@@ -174,11 +177,11 @@ def test_cli(tmp_path, capsys):
     out = tmp_path / "tilt.bin"
     assert cli(["asm", str(src), "-o", str(out)]) == 0
     img = out.read_bytes()
-    assert len(img) == 0x42D and img[0x400:0x402] == b"\xd8\xf1"
+    assert len(img) == 0x42F and img[0x400:0x402] == b"\xd8\xf1"
     capsys.readouterr()
     assert cli(["dis", str(out), "--start", "0x400", "--asm"]) == 0
     text = capsys.readouterr().out
-    assert "branch 0x042b" in text and "mac 3,1" in text
+    assert "branch 0x042d" in text and "mac 3,1" in text
     assert assemble(text).code() == img[0x400:]
     assert cli(["facts", "--chip", "icm20948"]) == 0
     assert "ram.fifo.icm" in capsys.readouterr().out

@@ -39,9 +39,10 @@ def mahony(s):
     ax = s.accel.x * 0.5
     ay = s.accel.y * 0.5
     az = s.accel.z * 0.5
-    e = [ay * vz - az * vy,
-         az * vx - ax * vz,
-         ax * vy - ay * vx]
+    # |a/2 x v| <= |a/2| <= sqrt(3) with every axis saturated; interval arithmetic sees 2
+    e = [dmp.assume(ay * vz - az * vy, -1.75, 1.75),
+         dmp.assume(az * vx - ax * vz, -1.75, 1.75),
+         dmp.assume(ax * vy - ay * vx, -1.75, 1.75)]
     h = [0.0, 0.0, 0.0]
     for i in range(3):
         b[i] = dmp.clamp(b[i] + KIH * e[i], -BMAX, BMAX)

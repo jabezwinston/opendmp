@@ -145,3 +145,65 @@ def test_probe91_vendor_free_packets():
     assert words(r.fifo) == hw1 and r.ints == 1
     r = m.run_pass(Sample(ax=1))
     assert words(r.fifo)[3] & 0xFFFF == 0 and words(r.fifo)[4] == 2
+
+
+# ---- probes 95-101 (ISA2 Finding 40): what opendmp's first silicon runs uncovered ----
+ONE = 1 << 30
+A99 = [-ONE // 2, ONE // 4, 3 * ONE // 4, -ONE]
+B99 = [ONE // 2, -ONE // 4, -3 * ONE // 4, ONE]
+
+
+def flag_after(chip, op_byte, mode_byte, a_words, b_words):
+    """Run `mode op` with P0 = 0x100, P1 = 0x110, P2 -> 0x120 (RAM); report F via markers."""
+    icm = chip == "icm20948"
+    code = ([0xF1, 0xD8] if icm else [0xD8, 0xF1]) + [0xDC, 0xB9, 0xA2, mode_byte, 0xB1, 0x80, 0xB5, 0x91,
+                                                      op_byte, 0xDD, 0xB3, 0x8F, 0xD9, 0xC0, 0xDA, 0xC2, 0xD8]
+    m, r = run1(code, chip=chip, entry=0x1000 if icm else 0x400,
+                setup=lambda m: (m.poke_words(0x100, [w & 0xFFFFFFFF for w in a_words]),
+                                 m.poke_words(0x110, [w & 0xFFFFFFFF for w in b_words]),
+                                 m.poke_words(0x3F0, [0x0F0F0F0F, 0x0E0E0E0E])))
+    return words(r.fifo)[0] == 0x0F0F0F0F
+
+
+@pytest.mark.parametrize("chip", ["mpu6050", "icm20948"])
+def test_probe99_flags(chip):
+    """CMP (f5 op 1) tests signs only; RSUB, ADD, MUL give the exact sign (both parts)."""
+    for i in range(4):
+        for j in range(4):
+            a, b = A99[i], B99[j]
+            byte = (i << 5) | (j << 3)
+            assert flag_after(chip, byte | 1, 0xF5, A99, B99) == (a < 0 <= b)      # "cmp"
+            assert flag_after(chip, byte | 1, 0xF1, A99, B99) == (b - a < 0)      # rsub
+            assert flag_after(chip, byte | 0, 0xF1, A99, B99) == (a + b < 0)      # add
+            assert flag_after(chip, byte | 2, 0xF1, A99, B99) == (a * b < 0)      # mul
+
+
+@pytest.mark.parametrize("chip", ["mpu6050", "icm20948"])
+def test_probe100_rsub_cannot_subtract_minus_two(chip):
+    for a, b, f in [(-3 * ONE // 2, 3 * ONE // 2, False), (3 * ONE // 2, -3 * ONE // 2, True),
+                    (-2 * ONE, 0, True), (0, -2 * ONE, True), (-2 * ONE, 2 * ONE - 1, True),
+                    (2 * ONE - 1, -2 * ONE, True), (ONE, ONE, False), (-1, 0, False), (0, -1, True)]:
+        assert flag_after(chip, 0x01, 0xF1, [a, 0, 0, 0], [b, 0, 0, 0]) == f, (a, b)
+
+
+def test_probe101_branch_is_signed_6_bit():
+    head = [0xD8, 0xF1, 0xDC, 0xB9, 0xA0, 0xDE]            # P2 -> 0x100, cleared
+    for d in range(0x20):                                   # forward: 64 incs, landing +d
+        m, r = run1(head + [0xF4, d] + [0xF8] * 64 + [0xD8, 0xFE])
+        assert m.peek_word(0x100) == 64 - d
+    for d in range(0x22, 0x3A):                             # backward into a 24-inc sled
+        m, r = run1(head + [0xF4, 0x1C] + [0xF8] * 24 + [0xD8, 0xFE, 0xFF, 0xFF] + [0xF4, d, 0xD8, 0xFE])
+        assert m.peek_word(0x100) == 0x420 - (0x426 + d - 64)
+
+
+def test_probe96_f4_leaves_mode_4():
+    ptrs = [0xDC, 0xB1, 0x80, 0xB5, 0x91, 0xB9, 0xA2]                   # RAM; P0, P1, P2
+    setup = lambda m: m.poke_words(0x100, [0x20000000, 0xF0000000, 0, 0, 0x10000000, 0, 0, 0,
+                                           0xEEEEEEEE])
+    m, r = run1([0xF1] + ptrs + [0xF4, 0x00, 0xC2], setup=setup)       # MOV works in mode 4
+    assert m.peek_word(0x120) & 0xFFFFFFFF == 0xF0000000
+    for pre in ([0xF4, 0x00], [0xF4, 0x40], [0xF4, 0xB0], [0x08, 0xDA, 0xF4, 0x00, 0xD8]):
+        with pytest.raises(Unmodelled, match="mode 4"):                # an ALU byte is a jump there
+            run1([0xF1] + ptrs + pre + [0x00], setup=setup)
+    m, r = run1([0xF1] + ptrs + [0xF4, 0x00, 0xF1, 0x00], setup=setup)   # a mode byte ends it
+    assert m.peek_word(0x120) == 0x30000000

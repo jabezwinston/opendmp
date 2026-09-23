@@ -1,5 +1,5 @@
 ; tilt.asm -- PLAN.md section 3's tilt filter, hand-compiled, in opendmp assembly (MPU-6050).
-; tilt.s is the same program in InvensenseDMP's dmpasm syntax; both give the same 45 code bytes.
+; tilt.s is the same program in InvensenseDMP's dmpasm syntax; both give the same 47 code bytes.
 ; This file also carries the data, so it runs with no pokes:  python -m opendmp asm tilt.asm
         .chip   mpu6050
         .entry  0x400
@@ -49,9 +49,11 @@ param:  .dw     0.25q                           ; limit
         p0bank  1
         p0page  1               ; P0 -> work
         p1page  2               ; P1 -> param
-        fmode   5
-        cmp     3,0             ; F := angle - limit < 0 (exact: no wrap)
-        if f
+        store
+        p2page  1               ; P2 -> work.gy, free by now
+        fmode   1
+        rsub    3,0             ; gy := limit - angle; F := limit - angle < 0 (exact: no wrap)
+        if nf
         branch  join            ; angle <= limit: skip the interrupt
         always
         int

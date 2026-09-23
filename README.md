@@ -5,9 +5,148 @@ motion processor inside the MPU-6050 and the ICM-20948. The plan of record is
 [PLAN.md](PLAN.md). The language is specified by example in [examples/](examples/). The ISA
 knowledge comes from the sibling reverse-engineering repo, `~/Git_repos/InvensenseDMP`.
 
-**Today:** the emulator and the ISA tools (assembler, disassembler, the machine facts). The
-compiler is next (PLAN.md §9). A program needs **no vendor firmware**: it runs from zeroed
-memory on both parts, as measured on the bench (below).
+**Today:**
+- **The language's front end.** It parses, types, simulates and range-checks programs, and
+  there are two independent executable semantics that agree bit for bit.
+- **The compiler**, for both chips. All 12 examples build, and their bytes run in the emulator
+  equal the reference semantics on every pass.
+- **The host runtime.** It loads a program over the bench bridge, streams its packets, and
+  verifies a run on silicon. **All 12 examples are bit-exact on both parts.**
+- **The cycle-accurate emulator.**
+- **The ISA tools:** assembler, disassembler, and the machine facts.
+
+A program needs **no vendor firmware**: it runs from zeroed memory on both parts, as measured
+on the bench (below).
+
+## The language
+
+```python
+import opendmp as dmp
+
+@dmp.program(rate=200)
+def tilt(s):
+    angle: dmp.state(-1.5, 1.5) = 0.0            # kept across passes; the range is an assumption
+    limit: dmp.param = 0.25                      # the host may change it while running
+    angle = dmp.clamp(0.98 * (angle + s.gyro.y * 0.0873) + 0.02 * s.accel.x, -1.5, 1.5)
+    dmp.emit(angle, s.accel.z)                   # packet: angle q30 (4 B), accel_z int16 (2 B)
+    if angle > limit:
+        dmp.irq()
+```
+
+```bash
+python -m opendmp check examples/tilt.py        # types, packet layout, anything that can wrap
+python -m opendmp sim examples/tilt.py --gen tilt,walk -o out.csv    # or --sensors data.csv
+python -m opendmp ir examples/biquad.py          # what the front end made of it
+```
+
+From Python: `tilt.simulate(samples)` runs the reference semantics, and `tilt.check()` returns
+the range warnings. `tilt.build("mpu6050")` compiles it (below). The rules are in PLAN.md §2 and §4. The one to know: a `+`/`-` expression
+is summed exactly and wraps once, which is what the DMP's multiply-accumulate computes.
+
+An error points at the construct and says what to do instead:
+
+```
+tilt.py:14:17: error: division by a variable: the DMP has no divide
+        angle = x / y
+                ^^^^^
+hint: multiply by a constant reciprocal (x * (1 / C)), or use a Newton step (examples/unit_vectors.py)
+```
+
+A range warning names the interval, where the wrapped value goes, and the fix:
+
+```
+acc.py:7:11: warning: `acc + s.gyro.z * 0.5` can reach [-3, 3], outside [-2, 2): it wraps before it is stored in acc
+        acc = acc + s.gyro.z * 0.5
+              ^^^^^^^^^^^^^^^^^^^^
+hint: declare a range on `acc` (dmp.state(lo, hi)) if it is narrower, or scale the terms down (x * 0.5), or dmp.assume(x, lo, hi) what interval arithmetic cannot see
+```
+
+## The compiler
+
+```bash
+python -m opendmp build examples/tilt.py            # build/tilt.mpu6050.{bin,lst,asm,json}, and icm20948
+python -m opendmp build examples/tilt.py --chip mpu --list    # print the listing
+```
+
+A build writes four files per chip:
+- `.bin`: the memory image, code and data;
+- `.lst`: the listing: every instruction with its address, bytes, cycles and the source line
+  it came from, and the data words by name;
+- `.asm`: the same program as opendmp assembly, annotated, which reassembles to the same bytes;
+- `.json`: the packet layout, the symbols (state, params, constants) and the entry point, for
+  the host.
+
+```
+; tilt  opendmp  chip mpu6050 (8.199 MHz)  entry 0x0400  200 Hz
+; addr  bytes     asm                    effect                                   cycles
+0400  d8        always                 predicate off                                5
+0401  f1        fmode 1                32-bit                                       5
+...
+        ; tilt.py:33  angle = dmp.clamp(K * (angle + s.gyro.y * GYRO_DT) + (1 - K) * s.accel.x, -1.5, 1.5)
+0410  f0        fmode 0                multiply-accumulate                          5
+...
+0416  78        mac 3,3                acc + P0.3 * P1.3                           60
+```
+
+From Python, `b = tilt.build("icm20948")` gives the image, `b.listing()`, `b.asm()`,
+`b.schema()`, and `b.emulate(samples)` runs the bytes in the emulator.
+
+What the compiler does (PLAN.md §6):
+- **Every `+`/`-` expression with a product is one MAC run**: products summed exactly and
+  floored once, as the language defines.
+- **Compares are RSUBs** into a scratch word; the DMP's `f5` "compare" tests signs only.
+  Where range analysis cannot rule out a subtrahend of exactly −2.0, a guard decides it first.
+- **`min`, `max`, `abs`, `clamp` and conditional values** are compare-and-skip.
+- **`dmp.loop(N)` is a real loop** on both chips; `while` is the ICM's only.
+- **Branches**: the MPU's reach −32..+31 bytes, so the assembler relaxes far ones into shared
+  hops; the ICM has 16-bit jumps. Both chips leave mode 4 after every branch, and the
+  scheduler restores the mode.
+- **The layout** packs state, params and constants from 0x010 (MPU) or 0x020 (ICM), and on
+  the ICM puts MAC destinations at odd words, so that every run starts fresh.
+
+| example | MPU-6050 bytes | cycles/pass (max) | ICM-20948 bytes | cycles/pass (max) | packet |
+|---|---:|---:|---:|---:|---:|
+| hello_fifo | 11 | 204 | 12 | 217 | 6 |
+| tilt | 83 | 899 | 95 | 743 | 6 |
+| goertzel | 72 | 1,258 | 83 | 864 | 4 |
+| vibration | 91 | 1,018 | 103 | 766 | 8 |
+| pedometer | 108 | 1,151 | 127 | 941 | 8 |
+| gyro_quat | 123 | 2,626 | 160 | 1,743 | 16 |
+| biquad | 124 | 2,068 | 158 | 1,524 | 12 |
+| taps | 140 | 1,037 | 162 | 929 | 8 |
+| pid_level | 165 | 1,719 | 191 | 1,358 | 8 |
+| mahony | 381 | 6,068 | 510 | 4,314 | 16 |
+| despike | 422 | 3,689 | 505 | 3,376 | 12 |
+| unit_vectors | 697 | 25,981 | 576 | 13,615 | 28 |
+
+Cycles are the emulator's on walking and shaking motion: 25,981 MPU cycles are 3.2 ms, inside
+unit_vectors' 10 ms period. The code is not yet optimised for size or cycles (PLAN.md §9,
+phase 5).
+
+## Running on silicon
+
+```bash
+python -m opendmp run examples/tilt.py --port /dev/ttyUSB0 --seconds 5 -o tilt.csv
+python -m opendmp run examples/mahony.py --port /dev/ttyUSB1 --seconds 5 --verify
+```
+
+`run` detects the part on the bench bridge (InvensenseDMP `bench/`), resets it, writes a
+minimal register set and the program over zeroed DMP memory, starts it and decodes its packets.
+The program is the whole firmware: no vendor image is loaded.
+
+`--verify` loads a **trace build** instead: every packet starts with that pass's raw sample
+words. The samples are replayed through the same bytes in the emulator and through the
+reference semantics, and every packet and interrupt must match:
+
+```
+mahony on the icm20948: 155 passes at 50.0 Hz; emulator 0 and reference 0 packets differ; interrupts 0 on silicon, 0 emulated; 4394-4394 cycles a pass: BIT-EXACT
+```
+
+All 12 examples verify on both rigs, about 3,700 passes in all. The first runs did not; the
+misses led to four ISA behaviours that no one had documented (ISA2.md Finding 40, below).
+
+From Python: `from opendmp.host import Rig, verify`; `Rig(port).load(build, rate)`, `.start()`,
+`.run(seconds)`.
 
 ## The emulator
 
@@ -92,14 +231,20 @@ measured behaviour as the default.
 
 ### Machine facts the emulator encodes that the manual does not (yet)
 
-Measured for this project on 2026-09-23 (ISA2.md Findings 37–39):
-- **One flag on both chips.** F is the sign of the **exact** result, so compares never
-  overflow. There is **no Z**: `d9` = IF F, `da` = IF ¬F, `d1` makes F = (result == 0).
+Measured for this project on 2026-09-23 (ISA2.md Findings 37–40):
+- **One flag on both chips.** ADD, RSUB and MUL set F to the sign of the **exact** result
+  (RSUB: unless A = −2.0, which it adds instead of subtracting). There is **no Z**: `d9` = IF F,
+  `da` = IF ¬F, `d1` makes F = (result == 0).
+- **The `f5` "compare" tests signs only**: F := A < 0 ≤ B. Earlier probes had used operands of
+  opposite signs, where it agrees with A − B < 0.
+- **The MPU's branch is signed**: `f4 d` reaches −32..+31 bytes. **Every `f4` leaves mode 4**
+  on the MPU as on the ICM, taken, not taken or skipped. An ALU op there reads as a jump, so
+  set the mode again after a branch.
 - **`f2`/`f3` are 16-bit lane modes, not just store widths.** Under `f3` the ALU computes on the
   sign-extended low halves, so a MUL there is `(lo·lo) >> 30`. Under `f2` it computes on the
   high halves.
-- **MIN** sets F := a > b and returns −1 when `b − a` overflows positively. **AND/XOR** leave F
-  alone.
+- **MIN** returns −1 when `b − a` overflows positively, and its F follows no simple rule.
+  **AND/XOR** leave F alone.
 - **The MAC restarts** on any destination move on the MPU, but only on an `op&4` pre-advance on
   the ICM. Products are summed exactly and floored once. **DMP3's `f0` is the MAC.**
 - **Across passes**, pointers, the P2 index, route, mode and F survive; the `fc`/`fd`
@@ -132,7 +277,7 @@ The assembler tracks the mode register and refuses code the hardware would read 
 - an ALU op from the wrong family (`min` under `fmode 1`);
 - any ALU op while DMP3's mode 4 is set;
 - an op at a jump target that different paths reach in different modes;
-- a branch outside the MPU's 0–63 forward bytes.
+- a branch outside the MPU's −32..+31 bytes.
 
 ```asm
         .chip   mpu6050
@@ -140,10 +285,11 @@ The assembler tracks the mode register and refuses code the hardware would read 
 const:  .dw     0.0873q, 1.0q, 0.98q, 0.02q
         .org    0x400                   ; .entry defaults to 0x400 (MPU), 0x1000 (ICM)
         always
-        fmode   5
-        cmp     3,0                     ; F := P0.3 - P1.0 < 0
-        if f
-        branch  join
+        store                           ; route -> RAM
+        fmode   1
+        rsub    3,0                     ; P2's word := P1.0 - P0.3; F := it < 0
+        if nf
+        branch  join                    ; P0.3 <= P1.0
         always
         int
 join:   always
@@ -154,11 +300,19 @@ join:   always
 
 ```
 opendmp/q30.py         the number model
+opendmp/api.py         the language's names (dmp.program, dmp.state, dmp.emit, ...); quat.py: dmp.quat
+opendmp/lang/          the front end: lowering to the IR, and the reference semantics
+opendmp/ir/            the IR, its interpreter, range analysis
+opendmp/sim.py         simulate(): packets, interrupts, decoded fields, wraps, failed assumptions
+opendmp/backend/       the compiler: instruction selection (tac), layout, scheduler, assembly (build)
+opendmp/host/          the bench bridge, Rig (load, start, stream) and verify
 opendmp/isa/           both ISAs as tables: encode/decode, the assembler, facts.py
-opendmp/cli.py         python -m opendmp dis | asm | facts
+opendmp/cli.py         python -m opendmp check | sim | ir | build | run | dis | asm | facts
 opendmp/emu/           the emulator (machine, chips, sched, files, gen, disasm, CLI)
-examples/              12 programs in the opendmp language; examples/emu/ runs today
-tests/                 pytest: hardware-transcribed vectors, cycles, scheduling, the ISA round trips, CLIs
+examples/              12 programs in the opendmp language; examples/emu/, a hand-written one in assembly
+tests/                 pytest: hardware-transcribed vectors, cycles, scheduling, the ISA round trips,
+                       the language (semantics, 40 refused constructs), the compiler (every example,
+                       both chips, bit-exact against the reference), CLIs
 PLAN.md                the plan of record
 ```
 
