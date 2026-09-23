@@ -9,7 +9,7 @@
         p2bank  1
         p2page  1               ; P2 -> work.gy
         store
-        .db     0xde            ; clr: gy := 0
+        clr                     ; gy := 0
         clr.next                ; ax := 0
         fmode   2               ; upper-half stores
         mov     0               ; ax.hi := accel_x
@@ -42,7 +42,7 @@
         p2page  1               ; P2 -> work.gy (scratch)
         fmode   1
         rsub    3,0             ; F := limit - angle < 0
-        if ge0                  ; (= if nf: da)
+        if nf                   ; da
         branch  2
         always
         int

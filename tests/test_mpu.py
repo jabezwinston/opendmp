@@ -186,6 +186,40 @@ def test_probe100_rsub_cannot_subtract_minus_two(chip):
         assert flag_after(chip, 0x01, 0xF1, [a, 0, 0, 0], [b, 0, 0, 0]) == f, (a, b)
 
 
+# (A, B, the value silicon stored, F): cells from probe103, identical on both parts (Finding 41)
+CLAMP_CELLS = [
+    (0x80000001, 0xC0000000, 0x40000000, True),     # A < 0: max(A, -B) = -B
+    (0x80000001, 0x7FFFFFFF, 0x80000001, False),    # A = -B: unchanged
+    (0x80000001, 0x80000001, 0x7FFFFFFF, True),     # B < 0 too: -B
+    (0x954FED61, 0xF91291C3, 0x06ED6E3D, True),
+    (0x954FED61, 0x39A59521, 0xC65A6ADF, True),     # the old "-1 when B - A overflows" case
+    (0x80000000, 0x00000001, 0xFFFFFFFF, True),     # probe86 F's "anomaly": max(-2.0, -1 lsb)
+    (0x80000000, 0x80000000, 0x80000000, True),     # -B = +2.0 wraps back to A, yet F is set
+    (0x00000005, 0xFFFFFFFB, 0xFFFFFFFB, True),     # A >= 0: min(A, B)
+    (0x00000000, 0xC0000000, 0xC0000000, True),     # A = 0 takes the min side
+    (0x30000000, 0x40000000, 0x30000000, False),    # inside the limits: unchanged
+    (0xD0000000, 0x40000000, 0xD0000000, False),
+    (0x60000000, 0x40000000, 0x40000000, True),     # clamped to +B
+    (0xA0000000, 0x40000000, 0xC0000000, True),     # clamped to -B
+]
+
+
+@pytest.mark.parametrize("chip", ["mpu6050", "icm20948"])
+def test_probe103_min_is_a_symmetric_clamp(chip):
+    for a, b, r, f in CLAMP_CELLS:
+        icm = chip == "icm20948"
+        code = ([0xF5, 0xD8] if icm else [0xD8, 0xF5]) + [0xDC, 0xB1, 0x80, 0xB5, 0x91, 0xB9, 0xA2, 0x00]
+        m, _ = run1(code, chip=chip, entry=0x1000 if icm else 0x400,
+                    setup=lambda m: (m.poke_words(0x100, [a]), m.poke_words(0x110, [b])))
+        assert m.peek_word(0x120) & 0xFFFFFFFF == r, (hex(a), hex(b))
+        assert flag_after(chip, 0x00, 0xF5, [a, 0, 0, 0], [b, 0, 0, 0]) == f, (hex(a), hex(b))
+    # on the lanes the rule runs on the half-words; only that half is written (probe103 C)
+    code = [0xD8, 0xF7, 0xDC, 0xB1, 0x80, 0xB5, 0x91, 0xB9, 0xA2, 0x00]
+    m, _ = run1(code, setup=lambda m: (m.poke_words(0x100, [0x1234_8000]), m.poke_words(0x110, [0x0000_0001]),
+                                       m.poke_words(0x120, [0x5A5A_5A5A])))
+    assert m.peek_word(0x120) & 0xFFFFFFFF == 0x5A5A_FFFF
+
+
 def test_probe101_branch_is_signed_6_bit():
     head = [0xD8, 0xF1, 0xDC, 0xB9, 0xA0, 0xDE]            # P2 -> 0x100, cleared
     for d in range(0x20):                                   # forward: 64 incs, landing +d
@@ -203,7 +237,27 @@ def test_probe96_f4_leaves_mode_4():
     m, r = run1([0xF1] + ptrs + [0xF4, 0x00, 0xC2], setup=setup)       # MOV works in mode 4
     assert m.peek_word(0x120) & 0xFFFFFFFF == 0xF0000000
     for pre in ([0xF4, 0x00], [0xF4, 0x40], [0xF4, 0xB0], [0x08, 0xDA, 0xF4, 0x00, 0xD8]):
-        with pytest.raises(Unmodelled, match="mode 4"):                # an ALU byte is a jump there
-            run1([0xF1] + ptrs + pre + [0x00], setup=setup)
+        m0, _ = run1([0xF1] + ptrs + pre, setup=setup)
+        m, r = run1([0xF1] + ptrs + pre + [0x00], setup=setup)          # 00 is a branch there, not ADD
+        assert m.peek_word(0x120) == m0.peek_word(0x120)
+        with pytest.raises(Unmodelled, match="mode 4"):                # 40-7f: no measured meaning
+            run1([0xF1] + ptrs + pre + [0x40], setup=setup)
     m, r = run1([0xF1] + ptrs + [0xF4, 0x00, 0xF1, 0x00], setup=setup)   # a mode byte ends it
     assert m.peek_word(0x120) == 0x30000000
+
+
+def test_probe104_mode4_one_byte_branch():
+    """In mode 4 an MPU byte below 0x40 is a one-byte branch to pc + 1 + sext6(b) (Finding 42)."""
+    head = [0xD8, 0xF1, 0xDC, 0xB9, 0xA0, 0xDE]            # P2 -> 0x100, cleared
+    for b in (0x00, 0x05, 0x1F):                           # forward over a 40-inc sled
+        m, r = run1(head + [0xF4, 0x00, b] + [0xF8] * 40 + [0xD8, 0xFE])
+        assert m.peek_word(0x100) == 40 - b
+    # back: `f4 01` over the hop byte into a sled, then 0x3c (-4) from after the sled's end
+    m, r = run1(head + [0xF4, 0x05, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xD8, 0xFE, 0xFF, 0xFF])
+    assert m.peek_word(0x100) == 0
+    # predicated: a false d9 skips it (F clear after an ALU op leaving 0)
+    zero = [0xB1, 0x8F, 0xB5, 0x9F, 0xDD, 0x01, 0xDC]         # P0, P1 -> zeros; FIFO a 0 - 0
+    m, r = run1(head + zero + [0xF4, 0x00, 0xD9, 0x02, 0xD8] + [0xF8] * 4 + [0xD8, 0xFE])
+    assert m.peek_word(0x100) == 4
+    m, r = run1(head + zero + [0xF4, 0x00, 0xDA, 0x02, 0xD8] + [0xF8] * 4 + [0xD8, 0xFE])
+    assert m.peek_word(0x100) == 3                          # taken: over d8 and one of the incs

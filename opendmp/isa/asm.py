@@ -29,7 +29,8 @@ from .core import ALU_OPS, F4_OPS, FAMILY_MODES, ICM, MPU, EncodeError, Insn, ch
 
 DEFAULT_ENTRY = {MPU: 0x0400, ICM: 0x1000}
 MEM_SIZE = {MPU: 0xC00, ICM: 0x4000}
-_TARGETED = ("branch", "jump", "call", "jump.m4", "call.m4")
+_TARGETED = ("branch", "branch.m4", "jump", "call", "jump.m4", "call.m4")
+_SIZE = {"branch": 2, "branch.m4": 1, "jump.m4": 2, "call.m4": 2}
 
 
 class AsmError(Exception):
@@ -123,7 +124,7 @@ def parse(text: str, chip=None) -> list[tuple[int, str, str, str | None]]:
         op, arg = parts[0].lower(), (parts[1].strip() if len(parts) > 1 else "")
         if op == "if":                              # `if f` / `if nf` / `if f.alt`
             op, arg = f"if {arg.lower()}", ""
-        op = {"disable": "end", "mov16": "movx", "swap": "xchg01"}.get(op, op)
+        op = {"disable": "end", "mov16": "movx", "swap": "xchg01", "min": "clamp"}.get(op, op)
         out.append((lineno, op, arg, label))
     return out
 
@@ -170,8 +171,8 @@ def assemble(text: str, chip=None) -> Program:
                 pc += len(data)
                 continue
             insn = Insn(op, _parse_args(op, arg))
-            n = (2 if insn.op in ("branch", "jump.m4", "call.m4") else 3) if _needs_label(insn) \
-                else len(encode(insn, chip, pc) if insn.op != "branch" else b"..")
+            n = _SIZE.get(insn.op, 3) if _needs_label(insn) \
+                else _SIZE[insn.op] if insn.op in ("branch", "branch.m4") else len(encode(insn, chip, pc))
             items.append((lineno, pc, insn, None, label))
             pc += n
         except (AsmError, EncodeError, ValueError) as e:
@@ -248,7 +249,7 @@ def _check_mode(insn: Insn, chip: str, mode: int | None):
         if mode not in FAMILY_MODES[fam]:
             need = {"mac": "f0", "arith": "f1-f3", "logic": "f5-f7"}[fam]
             raise AsmError(f"{insn.op} needs mode {need}, but fmode {mode} is in force")
-    if insn.op in ("jump.m4", "call.m4") and mode != 4:
+    if insn.op in ("jump.m4", "call.m4", "branch.m4") and mode != 4:
         raise AsmError(f"{insn.op} is a mode-4 target form; mode 4 is not in force")
     if chip == ICM and mode == 4 and insn.op == ".db" and insn.args and insn.args[0] < 0x80:
         raise AsmError(".db below 0x80 in mode 4 would decode as a jump target")
@@ -276,8 +277,8 @@ def disassemble(data: bytes, chip, org: int = 0, mode: int = 1) -> list[Line]:
     out, off = [], 0
     while off < len(buf):
         insn, n = decode(buf, off, chip, mode)
-        if insn.op == "branch":                     # decode() counts from the buffer's start
-            insn = Insn("branch", (org + insn.args[0],))
+        if insn.op in ("branch", "branch.m4"):      # decode() counts from the buffer's start
+            insn = Insn(insn.op, (org + insn.args[0],))
         out.append(Line(org + off, insn, buf[off:off + n], mode=mode, source=insn.text()))
         mode = next_mode(insn, chip, mode)
         off += n

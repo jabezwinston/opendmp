@@ -32,8 +32,19 @@ is shipped or needed** (see B1 below).
     builds replayed in the emulator. **All 12 examples are bit-exact on both rigs.** The first
     silicon runs found four ISA behaviours that the manual and the emulator had wrong (ISA2.md
     Finding 40, §7); they are measured, modelled and compiled around.
-- **Next:** Phase 5: optimisation (layout, cycles), ICM calls for `@dmp.sub`, and the
-  tutorial.
+  - **Phase 5, depth and polish**:
+    - **smaller, faster code**, 3,134 B for the twelve against 5,099 before (−39 %), with 22 %
+      fewer worst-case cycles, still bit-exact on both rigs. It comes from CLAMP selection,
+      copy propagation and dead-store elimination, a layout search scored by the scheduler,
+      loop-head state and one-byte branches;
+    - **ICM calls** for `@dmp.sub`, and `while` on both chips;
+    - **the runtime**: live param writes (declared ranges enforced) and state watching;
+    - **docs**: [docs/tutorial.md](docs/tutorial.md) and [docs/language.md](docs/language.md).
+
+    Two ISA findings came out of it, both measured on the rigs: `f5` op 0 is a symmetric clamp,
+    not MIN (Finding 41), and the MPU's mode-4 low bytes are one-byte branches (Finding 42).
+- **Next:** `s.fsync` in the backend; a worst-case cycle bound for loops with known trip
+  counts; state readback into CSV from the CLI.
 
 ## 1. Decisions (2026-09-23)
 
@@ -103,11 +114,11 @@ $ opendmp sim   tilt.py --sensors walk.csv           # the cycle-accurate emulat
   and `dmp.emit(tilt=a - b)` names an expression. The width comes from the type: Q30 is 4 B and
   a raw sensor is its int16, 2 B.
 - **Loops.** `for i in range(N)` with a constant N always unrolls. `for _ in dmp.loop(N):` with
-  `break` is a bounded loop: a real backward jump on the ICM, unrolled with forward exits on
-  the MPU. `while` is ICM-only.
+  `break` is a bounded loop and `while` an unbounded one: real backward branches on both chips.
 - **Helpers.** A helper `def` is inlined and may update the state lists passed to it. On the
-  ICM, `@dmp.sub` makes a real call. Its arguments and results live in the sub's own fixed
-  page and are copied in and out, because the DMP has no indirect addressing.
+  ICM, a `@dmp.sub` called more than once is one routine, with a real call. Its arguments and
+  results live in the sub's own fixed words and are copied in and out, because the DMP has no
+  indirect addressing.
 
 ### Style suggestions (writing good DMP programs)
 
@@ -202,10 +213,10 @@ pointers select, and the data (`.dw`), so it can be read, edited and reassembled
 | `+ - *`, unary `-`, `abs`, `min`, `max`, `dmp.clamp` | yes | yes |
 | `x * CONST`, `x / CONST` (a multiply by the reciprocal), `x * 2**k` (adds, a multiply, or the ICM shifter) | yes | yes |
 | comparisons, `and`/`or`/`not`, `a if c else b` | yes, never overflow (§6.4) | yes |
-| `if`/`elif`/`else`, nested | yes (branch-skip, trampolines past 63 B) | yes (jumps) |
+| `if`/`elif`/`else`, nested | yes (branch-skip, hops past ±32 B) | yes (jumps) |
 | `for i in range(N)`, N constant | unrolled | unrolled |
-| `for _ in dmp.loop(N)` + `break` | unrolled, with forward exits | a real loop |
-| `while` | **error**: the MPU has no backward branch | a real loop; warns: unbounded pass time |
+| `for _ in dmp.loop(N)` + `break` | a real loop | a real loop |
+| `while` | a real loop (unbounded pass time) | a real loop (unbounded pass time) |
 | helper `def` | inlined | inlined, or `@dmp.sub` = call (depth ≤ 4, no recursion) |
 | state lists, constant indices, tuple unpacking, several return values | yes | yes |
 | `Int` `+= 1`, `-= 1`, compare with 0..63 | `INC`/`DEC`, compare via ALU | `INC`/`DEC`, `fc cK Y` immediate compare |
@@ -308,7 +319,7 @@ raises `Unmodelled` for anything with no measured meaning.
 
 ## 6. The hard parts
 
-### 6.1 Chip profiles (measured: ISA2.md Findings 37–40)
+### 6.1 Chip profiles (measured: ISA2.md Findings 37–42)
 
 | | mpu6050 (mantis) | icm20948 (DMP3) |
 |---|---|---|
@@ -317,9 +328,10 @@ raises `Unmodelled` for anything with no measured meaning.
 | hardware-written RAM | **0x000–0x00D only**: ax ay az temp gx gy gz as int16 BE, every pass, only while the DMP runs (B2). 0x00E–0x00F are free | **0x0000–0x0011**: 0–3 cleared, then ax ay az gx gy gz temp (FSYNC is temp bit 0); **plus every FIFO byte, into 0x3000–0x3FFF** (B2) |
 | boot | **no vendor image** (B1): device reset (it keeps DMP memory), minimal registers, zero all memory, load, `DMP_CFG_1/2` = entry | the same (B1); HW_FIX_DISABLE / SINGLE_FIFO_PRIORITY_SEL not needed |
 | flag | **one flag F on both chips**; `d1` makes it result == 0; `d9` IF F, `da` IF ¬F; **no Z**. ADD/RSUB/MUL set the exact sign (RSUB: unless A = −2.0); **`f5` op 1 only tests signs** (Finding 40) | same |
-| control flow | **signed 6-bit branch: −32..+31 B** (`f4 41`–`7f` is the interrupt); **every `f4` leaves mode 4**, where a low byte is a jump (Finding 40) | 16-bit jump and call (4 deep), `e0`, loops; mode-4 hygiene |
+| control flow | **signed 6-bit branch: −32..+31 B** (`f4 41`–`7f` is the interrupt); **every `f4` leaves mode 4**, where a byte below 0x40 is a **one-byte branch** (Findings 40, 42); no absolute jump | 16-bit jump and call (4 deep), `e0`, loops; mode-4 hygiene |
 | multiply-accumulate | `f0`; **any destination move restarts the sum** | `f0` too; **only an op&4 pre-advance restarts it** |
 | `f2`/`f3` | **16-bit lanes, not just store widths**: `f3` computes on sign-extended low halves (a MUL there is tiny), `f2` on high halves; the same for `f6`/`f7` | same |
+| `f5` op 0 | **a symmetric clamp**: A ≥ 0 ? min(A, B) : max(A, −B); F := clamped (Finding 41) | same |
 | interrupt | `fe` | `e2` |
 | clock, cycles (cheap / MOV / ADD / MUL / MAC) | 8.199 MHz: 5 / 18 / 28 / 58 / 60 | 20.975 MHz: 4 / 17 / 26 / 25 / 27 |
 | pass start after the tick | 110 cycles (13.4 µs) | 130 cycles (6.2 µs) |
@@ -331,16 +343,21 @@ raises `Unmodelled` for anything with no measured meaning.
 
 Every ALU op needs its A operand on P0's page, its B operand on P1's page and its destination
 at P2's walked word index. The index only moves forward: `inc` adds 1, `d0` adds 2, and a page
-load resets it to 0. The allocator packs values into four-word pages by operand affinity. Values
-that meet as A/B operands go on pages that stay loaded, and destinations are ordered within a
-page by first write so that P2 only walks forward. Temporaries are reused by liveness. The first
-version is greedy with a peephole pass, measured in **cycles** on the examples; the emulator
-reports them exactly. A better optimiser comes only if the examples show it is needed.
+load resets it to 0. **As built** (`backend/layout.py`):
+1. A first placement packs words into four-word pages by affinity: consecutive accesses by one
+   pointer to two words want them on one page.
+2. A seeded, bounded local search then moves and swaps words. It keeps a move when the
+   scheduler's real output (bytes, then cycles) does not get worse.
+
+Pointer loads were 38 % of all code bytes with the declaration-order placement; this halved
+them. Before layout, `backend/opt.py` removes plain copies (propagation over the control-flow
+graph) and stores nothing reads.
 
 The scheduler tracks the whole machine state: the three pointers (block, bank, page), the P2
 word index, routing, the mode register, the `fc`/`fd` toggles, `bf`, the predicate, mode 4, and
 what the MAC accumulator holds. It emits only the bytes that change state. At a join, state
-that differs between the paths becomes unknown and is reloaded. **Width modes are lane modes**:
+that differs between the paths becomes unknown and is reloaded. At a loop head the state is the
+join of the entry and every back edge, found by iterating the schedule to a fixed point. **Width modes are lane modes**:
 nothing arithmetic may run under `f2`/`f3` unless a 16-bit lane op is intended.
 
 ### 6.3 Instruction selection
@@ -354,7 +371,10 @@ nothing arithmetic may run under `f2`/`f3` unless a 16-bit lane op is intended.
 | `s.accel.x`, `s.gyro.y` | `de`, then `f2` MOV or MOVX: the exact int16 lands in the upper half with a zero lower half |
 | 16-bit data | a lane op under `f2`/`f3` is cheaper (22 / 52 cycles on the MPU) but computes on half-words |
 | `2*a`, `4*a` | `a + a` with P0 and P1 on the same page |
-| `min`, `max`, `abs`, `clamp` | compare-and-select: MOV, compare, skip the second MOV (MIN's flag has no simple rule, and its `b − a` overflows); `abs` negates with NMUL by 1.0 |
+| `dmp.clamp(x, -c, c)` | **one CLAMP** (`f5` op 0, Finding 41); an asymmetric clamp shifts to symmetric about its midpoint where `x − m` cannot wrap |
+| `min`, `max` | one CLAMP when one side is a constant and the other's range allows; else compare-and-select: MOV, compare, skip the second MOV |
+| `abs` | compare, then NMUL by 1.0 |
+| `@dmp.sub` (ICM, called 2+ times) | one routine after the pass's `end`; `call`, `ret`; nothing assumed after a call |
 | `a & b`, `a ^ b` (Bits) | `f5` AND / XOR (they leave F alone) |
 | `n += 1` (Int) | INC |
 | `a < b` and friends | RSUB into a scratch word (the `f5` "compare" only tests signs). Where range analysis says the subtrahend can be exactly −2.0, a guard RSUB against −2.0 + 1 lsb decides that case first. `==`/`!=`: RSUB then `d1`, with the operand that cannot be −2.0 as A, or the XOR of both against 0 |
@@ -428,6 +448,8 @@ their probes) are the executable form of the same table.
 | new | `f2`/`f3`/`f6`/`f7` | both | **16-bit lanes** (probe86 A/E/F, probe88) |
 | new | timing | both | **cycle counts, clocks, start latency, tick stalls** (probe90, with the bridge's new `W` command) |
 | new | control flow and compares, found by the first silicon runs | both | **every `f4` leaves mode 4** on the MPU too; the MPU branch is **signed 6-bit**; the `f5` "compare" **tests signs only**; RSUB's F is exact except A = −2.0; MOV/CLR/INC under every mode as modelled (probes 92–101, Finding 40) |
+| new | `f5` op 0, measured before compiling to it | both | **a symmetric clamp**, not MIN; F := clamped; lanes too (probe103, 1,920 cells per part, Finding 41) |
+| new | the MPU's mode-4 low bytes | MPU | **one-byte branches**, 10 cycles taken, predicable; no absolute jump; the vendor's eMD code chains hops with them (probe104, Finding 42) |
 
 ## 8. How it is verified
 
@@ -469,7 +491,7 @@ their probes) are the executable form of the same table.
 | **2 Front end** | ast subset, errors, IR, reference semantics, range analysis | **done** 2026-09-23: the examples parse, simulate (two engines, bit-exact) and range-check clean; 40 refused constructs give their documented messages |
 | **3 Backends** | layout, selection, scheduler, MPU and ICM control flow, `.lst`/`.asm`/`.bin`/`.json` | **done** 2026-09-23: M1 met; all 12 examples build for both chips, emulator = reference |
 | **4 Runtime and silicon** | `host/` (bridge, whole-program init, params, packet stream), trace builds | **done** 2026-09-23: M2 met, and more: **all 12 examples bit-exact on both rigs** |
-| **5 Depth and polish** | a layout that minimises pointer loads, MIN where it is safe, ICM `call` for `@dmp.sub`, state readback and live param writes in the runtime, tutorial and language reference | next |
+| **5 Depth and polish** | a layout that minimises pointer loads, CLAMP (was "MIN where it is safe"), ICM `call` for `@dmp.sub`, state readback and live param writes in the runtime, tutorial and language reference | **done** 2026-09-23: −39 % code, −22 % worst-case cycles, all 12 bit-exact on both rigs |
 
 ## 10. Risks
 
@@ -496,17 +518,16 @@ mantis ISA, add later); the 3050 lineage; an optimal (ILP) layout.
   at `InvensenseDMP/bench/esp32_dmp_bridge`.
 - Whether `opendmp build` prints the full `.lst` by default or only the summary.
 
-## 13. Issues found in InvensenseDMP (not fixed there, except as noted)
+## 13. Issues found in InvensenseDMP (fixed there where noted)
 
-1. `dmpasm.py` accepts `branch 0x40`–`0x7f`, but the displacement is 6 bits: `f4 41`–`7f`
-   raises DMP_INT and `f4 40` does nothing. So `branch 65` silently assembles an interrupt.
-   Manual §1.6, §3.6 and §7.1 still say "7-bit, ≤ 127". Worse, it is signed (item 7): `branch 32`
-   and above go backwards.
-2. Manual §2.9 says there is no AND/XOR and no compare other than `== 0`/MIN. This has been
-   stale since Finding 29.
-3. `dmpasm.py` has no mantis mnemonic for `de` (clear in place).
-4. **Superseded by Findings 37/38 (recorded in ISA2.md; the manual chapters are not yet
-   rewritten):**
+1. **Fixed 2026-09-23.** `dmpasm.py` accepted `branch 0x40`–`0x7f`, but the displacement is 6
+   bits (`f4 41`–`7f` raise DMP_INT, `f4 40` does nothing) and signed (item 7). It now takes
+   −32..31 or a label, and refuses an ALU op after a `branch` until a mode byte. The manual is
+   corrected.
+2. **Fixed 2026-09-23.** Manual §2.9 said there was no AND/XOR and no compare other than
+   `== 0`/MIN.
+3. **Fixed 2026-09-23.** `dmpasm.py` had no mantis mnemonic for `de` (clear in place); it is `clr`.
+4. **Superseded by Findings 37/38; the manual was rewritten for them on 2026-09-23:**
    - the MPU's "N and Z, d9 = IF (N ∨ Z)";
    - "f2/f3 are store widths";
    - "f0 on DMP3 is unmeasured";
@@ -516,10 +537,11 @@ mantis ISA, add later); the 3050 lineage; an optimal (ILP) layout.
    12" (probe84's own tag), and the ICM's "free RAM to 0x3fff" (the FIFO lives at
    0x3000–0x3fff).
 6. `dmpasm.py`'s mnemonics predate Findings 37–39 in places: `if le0`/`if ge0` on mantis (it is
-   `if f`/`if nf`), `mov16` (MOVX), the ALU op under `f0` spelled `add` (it is a MAC), `disable`
+   `if f`/`if nf`, which it now also accepts), `mov16` (MOVX), the ALU op under `f0` spelled `add` (it is a MAC), `disable`
    (end of pass). opendmp's assembler uses the corrected names and accepts `disable`/`mov16` as
    aliases. The two syntaxes produce identical bytes for `examples/emu/tilt`.
-7. **Superseded by Finding 40** (the manual is not yet rewritten): the MPU branch is signed
+7. **Superseded by Finding 40** (the manual was rewritten for it on 2026-09-23, and the
+   vendor's eMD 6.12 images turn out to loop with it): the MPU branch is signed
    (−32..+31), not "forward 0..63" (dmpasm accepts 0..0x7f); every `f4` leaves mode 4 on the
    MPU too, and mode-4 low bytes are jumps (Finding 33's "no jump" is wrong for them); the
    `f5` op 1 "compare" tests signs only (Finding 37's "F := a − b < 0" rests on opposite-sign

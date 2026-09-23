@@ -189,8 +189,10 @@ def cmd_build(a):
             from .emu.chips import get_chip
             c = get_chip(b.chip)
             us = b.cycles_straight() * c.cycle_ns / 1000
-            print(f"{p.name} for the {b.chip}: {b.size} B of code, packet {p.ir.packet_size} B, "
-                  f"at most {us:.1f} us per pass ({100 * us * p.opts['rate'] / 1e6:.1f} % of the period)"
+            when = (f"at most {us:.1f} us per pass ({100 * us * p.opts['rate'] / 1e6:.1f} % of the period)"
+                    if b.bounded else f"{us:.1f} us with every instruction once; loops run longer "
+                    "(`opendmp sim --engine emu:CHIP` counts them)")
+            print(f"{p.name} for the {b.chip}: {b.size} B of code, packet {p.ir.packet_size} B, {when}"
                   f"  -> {', '.join(str(f) for f in files)}")
     return rc
 
@@ -206,6 +208,16 @@ def cmd_run(a):
         return 1
     rig = Rig(a.port)
     try:
+        return _run(a, p, rig, verify, decode)
+    except (KeyError, ValueError) as e:
+        print(f"error: {e.args[0] if e.args else e}", file=sys.stderr)
+        return 1
+    finally:
+        rig.close()
+
+
+def _run(a, p, rig, verify, decode):
+    if True:
         if a.verify:
             v = verify(p, a.port, seconds=a.seconds, rate=a.rate, rig=rig)
             print(v.summary())
@@ -214,12 +226,19 @@ def cmd_run(a):
         else:
             b = p.build(rig.chip)
             rig.load(b, a.rate)
-            packets, ints = rig.run(a.seconds)
+            for name, value in (_assignment(s) for s in a.param):
+                rig.write(name, value)
+            changes = []
+            for s in a.set:
+                t, _, rest = s.partition(":")
+                changes.append((float(t), *_assignment(rest)))
+            watch = [n for w in a.watch for n in w.split(",") if n]
+            packets, ints = rig.run(a.seconds, watch=watch, period=a.watch_period, changes=changes)
             fields = [decode(p.ir.packet, pk) for pk in packets]
             print(f"{p.name} on the {rig.chip}: {len(packets)} packets at {rig.rate:.1f} Hz, {ints} interrupts")
+            for t, vals in rig.watched:
+                print(f"  t {t:7.2f}  " + "  ".join(f"{n} {v:.6g}" for n, v in vals.items()))
             ok = True
-    finally:
-        rig.close()
     for f in p.ir.packet:
         col = [d[f.name] for d in fields]
         if col:
@@ -233,6 +252,13 @@ def cmd_run(a):
                 w.writerow([i] + [d[n] for n in names])
         print(f"  wrote {a.output}")
     return 0 if ok else 1
+
+
+def _assignment(text):
+    name, _, value = text.partition("=")
+    if not name or not value:
+        raise SystemExit(f"expected NAME=VALUE, not {text!r}")
+    return name.strip(), float(value) if any(c in value for c in ".eE") else int(value, 0)
 
 
 def cmd_facts(a):
@@ -295,6 +321,13 @@ def main(argv=None):
     r.add_argument("--verify", action="store_true",
                    help="a trace build, replayed in the emulator and the reference: bit-exact or not")
     r.add_argument("-o", "--output", help="write the decoded packets as CSV")
+    r.add_argument("--param", action="append", default=[], metavar="NAME=VALUE",
+                   help="set a param (or state) before the start (repeatable)")
+    r.add_argument("--set", action="append", default=[], metavar="T:NAME=VALUE",
+                   help="set a param T seconds into the run (repeatable)")
+    r.add_argument("--watch", action="append", default=[], metavar="NAMES",
+                   help="read these states or params while running (comma-separated)")
+    r.add_argument("--watch-period", type=float, default=0.5, help="seconds between readings")
     r.set_defaults(fn=cmd_run)
     f = sub.add_parser("facts", help="the machine facts the tools rely on, with their evidence")
     f.add_argument("--chip")

@@ -31,7 +31,7 @@ def chip_name(chip) -> str:
 
 
 ARITH = ("add", "rsub", "mul", "nmul")                  # f1 f2 f3
-LOGIC = ("min", "cmp", "and", "xor")                    # f5 f6 f7   [HW, probe70/86]
+LOGIC = ("clamp", "cmp", "and", "xor")                  # f5 f6 f7   [HW, probe70/86/103]
 MACS = ("mac", "macn", "mac.m", "macn.m")               # f0: acc +/- A*B; op2/3 = op0/1 [HW, F30]
 FAMILY = {0: MACS, 1: ARITH, 2: ARITH, 3: ARITH, 5: LOGIC, 6: LOGIC, 7: LOGIC}
 ALU_OPS = {name: (fam, i) for fam, names in (("mac", MACS), ("arith", ARITH), ("logic", LOGIC))
@@ -85,7 +85,7 @@ class Insn:
             return f"{self.op} {','.join(str(x) for x in ops)}{',inc' if adv else ''}"
         if self.op in ("shl", "sar"):
             return f"{self.op} {a[0]}{',adv' if a[1] else ''}"
-        if self.op in ("branch", "jump", "call", "jump.m4", "call.m4"):
+        if self.op in ("branch", "branch.m4", "jump", "call", "jump.m4", "call.m4"):
             t = a[0]
             return f"{self.op} {t if isinstance(t, str) else f'{t:#06x}'}"
         if a:
@@ -152,6 +152,13 @@ def decode(buf, pc: int, chip, mode: int = 1) -> tuple[Insn, int]:
     if icm and mode == 4 and b < 0x80:                  # a branch target with no f4 of its own
         t = ((b << 8) | raw[1]) & 0x3FFF
         return Insn("call.m4" if b & 0x40 else "jump.m4", (t,)), 2
+    if not icm and mode == 4 and b < 0x80:
+        # the MPU in mode 4: a byte below 0x40 is a one-byte branch, the f4's signed displacement
+        # with the f4 implied (ISA2 Finding 42, probe104); 0x40-0x7f do not branch or interrupt,
+        # and have no other measured meaning
+        if b < 0x40:
+            return Insn("branch.m4", (pc + 1 + (b if b < 0x20 else b - 64),)), 1
+        return Insn(".db", (b,)), 1
     if b < 0x80:
         names = FAMILY.get(mode)
         if names is None:
@@ -256,6 +263,12 @@ def encode(insn: Insn, chip, pc: int | None = None) -> bytes:
             _rng(a[0], 1, 32, "sar: s")
             return bytes([0xFD, 0x20 | ((32 - a[0]) & 0x1F) | (0x40 if a[1] else 0)])
     else:
+        if op == "branch.m4":
+            t = a[0] if a else None
+            _chk(isinstance(t, int), f"{op}: unresolved target {t!r}")
+            d = t - (pc + 1)
+            _chk(-32 <= d <= 31, f"branch.m4: displacement {d} out of -32..31 (signed 6 bits)")
+            return bytes([d & 0x3F])
         if op == "branch":
             t = a[0] if a else None
             _chk(isinstance(t, int), f"branch: unresolved target {t!r}")
@@ -282,8 +295,8 @@ def effect(insn: Insn) -> str:
         fam, i = ALU_OPS[op]
         A, B = f"P0.{a[0]}", f"P1.{a[1]}"
         body = {"add": f"{A} + {B}", "rsub": f"{B} - {A}", "mul": f"{A} * {B}",
-                "nmul": f"-{A} * {B}", "min": f"min({A}, {B}); F := {A} > {B}",
-                "cmp": f"F := {A} - {B} < 0 (no store)", "and": f"{A} & {B}", "xor": f"{A} ^ {B}",
+                "nmul": f"-{A} * {B}", "clamp": f"{A} clamped to +-{B}; F := it was",
+                "cmp": f"F := {A} < 0 <= {B} (no store)", "and": f"{A} & {B}", "xor": f"{A} ^ {B}",
                 "mac": f"acc + {A} * {B}", "macn": f"acc - {A} * {B}",
                 "mac.m": f"acc + {A} * {B}", "macn.m": f"acc - {A} * {B}"}[op]
         return ("P2 word += 1; " if a[2] else "") + body
@@ -296,8 +309,10 @@ def effect(insn: Insn) -> str:
         return f"{op[:2].upper()} bank {a[0]}"
     if op == "fmode":
         return {0: "multiply-accumulate", 1: "32-bit", 2: "high 16-bit lane", 3: "low 16-bit lane",
-                5: "min/cmp/and/xor, 32-bit", 6: "min/cmp/and/xor, high lane",
-                7: "min/cmp/and/xor, low lane"}[a[0]]
+                5: "clamp/cmp/and/xor, 32-bit", 6: "clamp/cmp/and/xor, high lane",
+                7: "clamp/cmp/and/xor, low lane"}[a[0]]
+    if op == "branch.m4":
+        return f"branch {a[0] if isinstance(a[0], str) else f'{a[0]:#06x}'} (one byte, mode 4)"
     if op in ("branch", "jump", "call", "jump.m4", "call.m4"):
         return f"{op.split('.')[0]} {a[0] if isinstance(a[0], str) else f'{a[0]:#06x}'}"
     if op.startswith("cmp."):
@@ -322,10 +337,10 @@ _CHEAP = {"fmode", "always", "if f", "if nf", "if f.alt", "store", "fifo", "p2in
           "p0blk", "p1blk", "p2blk", ".db"}
 _KEYS = {"mov": "mov", "movx": "movx", "clr": "clr", "clr.next": "clr", "lo": "lo", "lo.next": "lo",
          "load": "sload", "shl": "shift", "sar": "shift", "inc": "inc", "dec": "inc",
-         "inc.next": "inc", "dec.next": "inc", "branch": "branch", "jump": "branch",
+         "inc.next": "inc", "dec.next": "inc", "branch": "branch", "branch.m4": "branch1", "jump": "branch",
          "jump.m4": "branch", "call": "call", "call.m4": "call", "ret": "ret", "int": "int",
          "int.fe": "int", "int.f4": "int2", "end": "halt", "p0page": "page", "p1page": "page",
-         "p2page": "page", "min": "min", "cmp": "cmp", "and": "logic", "xor": "logic"}
+         "p2page": "page", "clamp": "clamp", "cmp": "cmp", "and": "logic", "xor": "logic"}
 
 
 def cost_key(insn: Insn, mode: int) -> str:

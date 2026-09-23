@@ -2,13 +2,17 @@
 
     rig = Rig("/dev/ttyUSB0")                  # the part comes from the bridge
     rig.load(prog.build(rig.chip))             # reset, minimal init, zero memory, image, entry
-    packets = rig.run(seconds=5)               # the FIFO, cut into packets
+    rig.write("limit", 0.1)                    # a param (or a state), by name, before or while running
+    packets, ints = rig.run(seconds=5, watch=["angle"], changes=[(2.0, "limit", 0.3)])
+    rig.read("angle"), rig.watched             # a state now; the watch log [(t, {name: value})]
 
 The init is the minimal one measured in probe91: no image, no FIFO-rate patch, no I2C-master
 setup.  A device reset keeps DMP memory, so the loader clears it.
 """
 import time
 
+from ..ir import nodes as N
+from ..q30 import MASK, ONE, s32
 from .bridge import Bridge
 
 GYRO_FS = {250: 0, 500: 1, 1000: 2, 2000: 3}
@@ -29,6 +33,7 @@ class Rig:
             raise IOError(f"{port}: the bridge reports {part!r}")
         self.build = None
         self.rate = None
+        self.watched: list = []
 
     def close(self):
         self.b.close()
@@ -98,6 +103,43 @@ class Rig:
             self.reg(2, 0x50, bytes([e >> 8, e & 0xFF]))   # PRGM_START_ADDRH/L
         self.build = build
 
+    # ------------------------------------------------------------------ state and params
+    def _word(self, name):
+        if self.build is None:
+            raise ValueError("load a build first")
+        w = next((w for w in self.build.words if w.name == name and w.kind in ("state", "param")), None)
+        if w is None:
+            names = ", ".join(w.name for w in self.build.words if w.kind in ("state", "param"))
+            raise KeyError(f"{name!r} is not a state or param of {self.build.ir.name} ({names})")
+        return w
+
+    def read(self, name: str):
+        """A state's or param's current value, read from DMP memory (while running, too)."""
+        w = self._word(name)
+        raw = s32(int.from_bytes(self.b.mem_read(w.addr, 4), "big"))
+        return raw / ONE if (w.var is None or w.var.type == N.Q30) else raw
+
+    def write(self, name: str, value):
+        """Set a param (or a state) by name.  While the program runs, the word lands between two
+        passes, or -- rarely, for one pass -- is read half-written: the bridge writes its four
+        bytes in one I2C burst, and a pass may read it mid-burst."""
+        w, raw = self._encode(name, value)
+        self.b.mem_write(w.addr, (raw & MASK).to_bytes(4, "big"))
+
+    def _encode(self, name, value):
+        w = self._word(name)
+        rng = w.var.range if w.var is not None else None
+        if rng is not None and not rng[0] <= value <= rng[1]:
+            # the program was range-checked assuming this interval (dmp.param(lo, hi))
+            raise ValueError(f"{name} = {value}: outside its declared range [{rng[0]:g}, {rng[1]:g}]")
+        if w.var is None or w.var.type == N.Q30:
+            if not -2.0 <= value < 2.0:
+                raise ValueError(f"{name} = {value}: a q30 value is in [-2, 2)")
+            raw = round(value * ONE)
+        else:
+            raw = int(value)
+        return w, raw
+
     # ------------------------------------------------------------------ running
     def start(self):
         self.b.zero_ints()
@@ -116,16 +158,34 @@ class Rig:
         else:
             self.reg(0, 0x03, 0x40)                     # keep FIFO_EN: the FIFO stays readable
 
-    def run(self, seconds: float):
+    def run(self, seconds: float, watch=(), period: float = 0.25, changes=()):
         """Run the loaded program, reading the FIFO as it fills; (packets, interrupt count).
-        A partial packet at the end (the stop can land mid-pass) is dropped."""
+        A partial packet at the end (the stop can land mid-pass) is dropped.
+
+        watch:   state or param names read every `period` seconds into self.watched, as
+                 [(seconds since the start, {name: value})]
+        changes: [(at seconds, name, value)]: param writes made while the program runs"""
         size = self.build.packet_size
         cap = FIFO[self.chip]
         data = bytearray()
+        todo = sorted(changes, key=lambda c: c[0])
+        for name in watch:
+            self._word(name)
+        for _, name, value in todo:
+            self._encode(name, value)               # refuse a bad change before starting
+        self.watched = []
+        next_watch = 0.0
         self.start()
         t0 = time.time()
         try:
             while time.time() - t0 < seconds:
+                t = time.time() - t0
+                while todo and todo[0][0] <= t:
+                    _, name, value = todo.pop(0)
+                    self.write(name, value)
+                if watch and t >= next_watch:
+                    self.watched.append((round(t, 3), {n: self.read(n) for n in watch}))
+                    next_watch = t + period
                 n = self.b.fifo_count()
                 if n >= cap - size:
                     raise IOError(f"the FIFO filled ({n} B) faster than the bridge reads it: "

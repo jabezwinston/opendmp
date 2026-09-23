@@ -53,11 +53,15 @@ FACTS = [
          HW, "Finding 37, probe86 E-H, probe88, probe99/100"),
     Fact("flag.test", BOTH, "d1 makes F = (last result == 0)", HW, "Finding 37"),
     Fact("flag.logic", BOTH, "f5 op 1 (\"CMP\") stores nothing and tests signs only: F := A < 0 <= B "
-         "(so the compiler compares with RSUB); MIN's F has no simple rule; AND/XOR leave F alone",
-         HW, "probe98/99 (56 cells, both parts)"),
+         "(so the compiler compares with RSUB); AND/XOR leave F alone", HW,
+         "probe98/99 (56 cells, both parts)"),
+    Fact("alu.clamp", BOTH, "f5 op 0 (the vendor's \"MIN\") clamps A to [-B, B]: r = A >= 0 ? min(A, B) "
+         ": max(A, -B), -B exact, wrapped; F := A was clamped; on a lane, the same on the lane's "
+         "values", HW, "Finding 41, probe103 (1920 cells per part)"),
     Fact("mode4.mpu", MPU, "Every f4 (branch, f4 40, the one-byte form; taken, not taken or "
-         "skipped) leaves mode 4, where a byte below 0x80 is a two-byte jump, not an ALU op; MOV, "
-         "CLR, INC and page loads work there", HW, "probe95-97"),
+         "skipped) leaves mode 4.  There a byte below 0x40 is a ONE-byte branch to pc + 1 + "
+         "sext6(b) (10 cycles taken, 5 skipped, predicable), 0x40-0x7f neither branch nor "
+         "interrupt; MOV, CLR, INC and page loads work", HW, "probe95-97, probe104 (Finding 42)"),
     Fact("flag.frozen", BOTH, "F does not change while a predicate is armed (except d1, fc cK)",
          HW, "probe67/68, Finding 35"),
     Fact("pred.sticky", BOTH, "d9/da/db stay in force until the next d8-db; d9 = db = IF F, "
@@ -70,8 +74,6 @@ FACTS = [
     Fact("alu.lanes", BOTH, "f2/f6: the ALU computes on the high half-words in place (low halves "
          "cleared); f3/f7: on the sign-extended low halves as integers; INC/DEC/CLR honour the "
          "lane", HW, "Finding 37, probe86 A/E/F, probe88"),
-    Fact("alu.min_overflow", BOTH, "MIN returns -1 when b - a overflows positively (unexplained)",
-         HW, "Finding 37, probe86 F"),
     Fact("alu.preadvance", BOTH, "op&4 advances the P2 word index before the store", HW,
          "Finding 17, probe32"),
     Fact("mac.mode", BOTH, "Under f0 an ALU op is acc +/- A*B (op&1 = sign; op 2/3 = op 0/1), "

@@ -5,13 +5,17 @@ motion processor inside the MPU-6050 and the ICM-20948. The plan of record is
 [PLAN.md](PLAN.md). The language is specified by example in [examples/](examples/). The ISA
 knowledge comes from the sibling reverse-engineering repo, `~/Git_repos/InvensenseDMP`.
 
+**Start with [docs/tutorial.md](docs/tutorial.md)**; the language is specified in
+[docs/language.md](docs/language.md).
+
 **Today:**
 - **The language's front end.** It parses, types, simulates and range-checks programs, and
   there are two independent executable semantics that agree bit for bit.
 - **The compiler**, for both chips. All 12 examples build, and their bytes run in the emulator
   equal the reference semantics on every pass.
-- **The host runtime.** It loads a program over the bench bridge, streams its packets, and
-  verifies a run on silicon. **All 12 examples are bit-exact on both parts.**
+- **The host runtime.** It loads a program over the bench bridge, streams its packets, reads
+  states and writes params while it runs, and verifies a run on silicon. **All 12 examples are
+  bit-exact on both parts.**
 - **The cycle-accurate emulator.**
 - **The ISA tools:** assembler, disassembler, and the machine facts.
 
@@ -94,34 +98,40 @@ From Python, `b = tilt.build("icm20948")` gives the image, `b.listing()`, `b.asm
 What the compiler does (PLAN.md §6):
 - **Every `+`/`-` expression with a product is one MAC run**: products summed exactly and
   floored once, as the language defines.
+- **`dmp.clamp(x, -c, c)` is one instruction.** The DMP's `f5` op 0, long read as MIN, clamps
+  A to [−B, B] (ISA2 Finding 41). Asymmetric clamps shift to symmetric, and `min`/`max` with a
+  constant use it where the value's range allows. Other `min`/`max`/`abs` are compare-and-skip.
 - **Compares are RSUBs** into a scratch word; the DMP's `f5` "compare" tests signs only.
   Where range analysis cannot rule out a subtrahend of exactly −2.0, a guard decides it first.
-- **`min`, `max`, `abs`, `clamp` and conditional values** are compare-and-skip.
-- **`dmp.loop(N)` is a real loop** on both chips; `while` is the ICM's only.
-- **Branches**: the MPU's reach −32..+31 bytes, so the assembler relaxes far ones into shared
-  hops; the ICM has 16-bit jumps. Both chips leave mode 4 after every branch, and the
-  scheduler restores the mode.
-- **The layout** packs state, params and constants from 0x010 (MPU) or 0x020 (ICM), and on
-  the ICM puts MAC destinations at odd words, so that every run starts fresh.
+- **Loops**: `dmp.loop(N)` and `while` are real loops on both chips. At a loop head the
+  scheduler keeps whatever pointer and mode state the entry and every back edge agree on.
+- **Branches.** The MPU's reach −32..+31 bytes. Far branches are relaxed into shared hops,
+  and in mode 4 (after any branch) a branch is one byte (ISA2 Finding 42), as in the vendor's
+  own eMD code. The ICM has 16-bit jumps.
+- **Subs**: on the ICM a `@dmp.sub` called more than once is one routine (`call`/`ret`).
+- **Clean-up and layout.** Copy propagation and dead-store elimination run over the
+  control-flow graph. The layout of words in RAM is then searched, scored by the scheduler's
+  actual bytes and cycles (pointer loads were over a third of all code). On the ICM, MAC
+  destinations go at odd words.
 
 | example | MPU-6050 bytes | cycles/pass (max) | ICM-20948 bytes | cycles/pass (max) | packet |
 |---|---:|---:|---:|---:|---:|
 | hello_fifo | 11 | 204 | 12 | 217 | 6 |
-| tilt | 83 | 899 | 95 | 743 | 6 |
-| goertzel | 72 | 1,258 | 83 | 864 | 4 |
-| vibration | 91 | 1,018 | 103 | 766 | 8 |
-| pedometer | 108 | 1,151 | 127 | 941 | 8 |
-| gyro_quat | 123 | 2,626 | 160 | 1,743 | 16 |
-| biquad | 124 | 2,068 | 158 | 1,524 | 12 |
-| taps | 140 | 1,037 | 162 | 929 | 8 |
-| pid_level | 165 | 1,719 | 191 | 1,358 | 8 |
-| mahony | 381 | 6,068 | 510 | 4,314 | 16 |
-| despike | 422 | 3,689 | 505 | 3,376 | 12 |
-| unit_vectors | 697 | 25,981 | 576 | 13,615 | 28 |
+| tilt | 45 | 662 | 49 | 517 | 6 |
+| pid_level | 56 | 1,043 | 55 | 711 | 8 |
+| goertzel | 61 | 1,190 | 63 | 771 | 4 |
+| vibration | 70 | 915 | 81 | 673 | 8 |
+| gyro_quat | 80 | 2,255 | 90 | 1,307 | 16 |
+| pedometer | 95 | 1,101 | 108 | 869 | 8 |
+| biquad | 97 | 1,834 | 98 | 1,185 | 12 |
+| taps | 116 | 962 | 136 | 853 | 8 |
+| mahony | 190 | 4,575 | 221 | 2,668 | 16 |
+| despike | 341 | 3,094 | 383 | 2,705 | 12 |
+| unit_vectors | 409 | 18,896 | 267 | 11,548 | 28 |
 
-Cycles are the emulator's on walking and shaking motion: 25,981 MPU cycles are 3.2 ms, inside
-unit_vectors' 10 ms period. The code is not yet optimised for size or cycles (PLAN.md §9,
-phase 5).
+Cycles are the emulator's on walking and shaking motion. 18,896 MPU cycles are 2.3 ms, inside
+unit_vectors' 10 ms period. Before the Phase 5 optimisations the twelve came to 5,099 bytes;
+they are now 3,134 (−39 %), with 22 % fewer worst-case cycles.
 
 ## Running on silicon
 
@@ -142,11 +152,23 @@ reference semantics, and every packet and interrupt must match:
 mahony on the icm20948: 155 passes at 50.0 Hz; emulator 0 and reference 0 packets differ; interrupts 0 on silicon, 0 emulated; 4394-4394 cycles a pass: BIT-EXACT
 ```
 
-All 12 examples verify on both rigs, about 3,700 passes in all. The first runs did not; the
-misses led to four ISA behaviours that no one had documented (ISA2.md Finding 40, below).
+All 12 examples verify on both rigs, about 3,700 passes in all, before and after the Phase 5
+optimisations. The first runs did not; the misses led to four ISA behaviours that no one had
+documented (ISA2.md Finding 40, below).
 
-From Python: `from opendmp.host import Rig, verify`; `Rig(port).load(build, rate)`, `.start()`,
-`.run(seconds)`.
+Params and states are live:
+
+```bash
+python -m opendmp run examples/pid_level.py --port /dev/ttyUSB0 --seconds 4 \
+    --param setpoint=0.1 --set 2:setpoint=-0.1 --watch integ,pitch
+```
+
+`--param` sets before the start, `--set T:NAME=VALUE` during the run, and `--watch` reads states
+as it goes. A write outside a param's declared range is refused.
+
+From Python: `from opendmp.host import Rig, verify`; `rig = Rig(port)`, `rig.load(build)`,
+`rig.run(seconds, watch=[...], changes=[(t, name, value)])`, `rig.read(name)`,
+`rig.write(name, value)`.
 
 ## The emulator
 
@@ -199,7 +221,7 @@ Finding 38):
 | clock (this bench's parts) | 8.199 MHz | 20.975 MHz |
 | predicate / mode / pointer / skipped byte | 5 | 4 |
 | MOV | 18 | 17 |
-| ADD, RSUB, MIN | 28 | 26 |
+| ADD, RSUB, CLAMP | 28 | 26 |
 | MUL | 58 | 25 |
 | MAC | 60 | 27 |
 | taken branch / jump | 15 | 13 |
@@ -231,7 +253,7 @@ measured behaviour as the default.
 
 ### Machine facts the emulator encodes that the manual does not (yet)
 
-Measured for this project on 2026-09-23 (ISA2.md Findings 37–40):
+Measured for this project on 2026-09-23 (ISA2.md Findings 37–42):
 - **One flag on both chips.** ADD, RSUB and MUL set F to the sign of the **exact** result
   (RSUB: unless A = −2.0, which it adds instead of subtracting). There is **no Z**: `d9` = IF F,
   `da` = IF ¬F, `d1` makes F = (result == 0).
@@ -243,8 +265,10 @@ Measured for this project on 2026-09-23 (ISA2.md Findings 37–40):
 - **`f2`/`f3` are 16-bit lane modes, not just store widths.** Under `f3` the ALU computes on the
   sign-extended low halves, so a MUL there is `(lo·lo) >> 30`. Under `f2` it computes on the
   high halves.
-- **MIN** returns −1 when `b − a` overflows positively, and its F follows no simple rule.
-  **AND/XOR** leave F alone.
+- **`f5` op 0 is a symmetric clamp, not MIN**: A ≥ 0 ? min(A, B) : max(A, −B), F := it clamped
+  (1,920 cells per part, Finding 41). **AND/XOR** leave F alone.
+- **In the MPU's mode 4 a byte below 0x40 is a one-byte branch** (Finding 42): there is no
+  absolute jump, but a branch after a branch costs one byte and 10 cycles.
 - **The MAC restarts** on any destination move on the MPU, but only on an `op&4` pre-advance on
   the ICM. Products are summed exactly and floored once. **DMP3's `f0` is the MAC.**
 - **Across passes**, pointers, the P2 index, route, mode and F survive; the `fc`/`fd`
@@ -270,7 +294,8 @@ the names corrected by Findings 37–39:
 - `if f` / `if nf`;
 - `movx`;
 - `fmode 0` then `mac A,B` for the multiply-accumulate;
-- `fmode 5` then `min`/`cmp`/`and`/`xor`;
+- `fmode 5` then `clamp`/`cmp`/`and`/`xor` (`min` is accepted for `clamp`);
+- `branch.m4` for the MPU's one-byte branch in mode 4;
 - `end`.
 
 The assembler tracks the mode register and refuses code the hardware would read differently:
@@ -304,7 +329,7 @@ opendmp/api.py         the language's names (dmp.program, dmp.state, dmp.emit, .
 opendmp/lang/          the front end: lowering to the IR, and the reference semantics
 opendmp/ir/            the IR, its interpreter, range analysis
 opendmp/sim.py         simulate(): packets, interrupts, decoded fields, wraps, failed assumptions
-opendmp/backend/       the compiler: instruction selection (tac), layout, scheduler, assembly (build)
+opendmp/backend/       the compiler: selection (tac), clean-up (opt), layout search, scheduler, assembly (build)
 opendmp/host/          the bench bridge, Rig (load, start, stream) and verify
 opendmp/isa/           both ISAs as tables: encode/decode, the assembler, facts.py
 opendmp/cli.py         python -m opendmp check | sim | ir | build | run | dis | asm | facts
@@ -313,6 +338,7 @@ examples/              12 programs in the opendmp language; examples/emu/, a han
 tests/                 pytest: hardware-transcribed vectors, cycles, scheduling, the ISA round trips,
                        the language (semantics, 40 refused constructs), the compiler (every example,
                        both chips, bit-exact against the reference), CLIs
+docs/                  tutorial.md (start here), language.md (the reference)
 PLAN.md                the plan of record
 ```
 

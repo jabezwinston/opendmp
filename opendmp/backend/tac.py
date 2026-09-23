@@ -49,7 +49,7 @@ class Op:
 
 @dataclass(eq=False)
 class Alu(Op):
-    op: str                       # add rsub mul nmul (mode 1) | min and xor (mode 5)
+    op: str                       # add rsub mul nmul (mode 1) | clamp and xor (mode 5)
     dst: Word
     a: Word                       # P0
     b: Word                       # P1
@@ -114,6 +114,21 @@ class Branch(Op):
 class Label(Op):
     name: str
     loop_head: bool = False       # reached by a backward jump: nothing is known there
+    entry: bool = False           # a routine's entry (ICM): reached only by calls
+
+
+@dataclass(eq=False)
+class Call(Op):
+    """Call a routine (ICM `f4 hi|0x40 lo`).  reads/writes: the words the routine (and what it
+    calls) may touch, filled in once the routine is selected."""
+    label: str
+    reads: frozenset = frozenset()
+    writes: frozenset = frozenset()
+
+
+@dataclass(eq=False)
+class Ret(Op):
+    pass
 
 
 @dataclass(eq=False)
@@ -133,6 +148,18 @@ class Source(Op):
 
 
 # ------------------------------------------------------------------ selection
+def count_calls(stmts, acc: dict) -> dict:
+    """How many call sites each sub has in `stmts` (not counting inside the subs themselves)."""
+    for s in stmts:
+        if isinstance(s, N.CallSub):
+            acc[s.sub] = acc.get(s.sub, 0) + 1
+        for attr in ("then", "els", "body"):
+            inner = getattr(s, attr, None)
+            if isinstance(inner, list):
+                count_calls(inner, acc)
+    return acc
+
+
 TRACE_WORDS = {"mpu6050": (0, 1, 2, 3), "icm20948": (1, 2, 3, 4)}   # the sample page, as words
 
 
@@ -151,6 +178,11 @@ class Selector:
         self.scratch = None
         self.sample_map = SAMPLE_ICM if self.icm else SAMPLE_MPU
         self.intervals = analyse(ir).intervals      # id(expr) -> (lo, hi): which compares need a guard
+        # ICM: a sub called more than once becomes a routine (call/ret), within the 4-deep stack
+        self.routines: dict = {}                    # SubIR -> entry label
+        self.pending: list = []
+        self.calls = count_calls(ir.body, {})
+        self.depth = {}
 
     def may_be_min(self, e) -> bool:
         """Can e be exactly -2.0 (the one value `rsub` cannot subtract)?"""
@@ -233,7 +265,24 @@ class Selector:
                 self.emit(Mov(FIFO, self.sample_word(k)))
         self.ops += body
         self.emit(End())
+        while self.pending:                         # the routines, after the pass's end
+            sub = self.pending.pop(0)
+            self.emit(Label(self.routines[sub], entry=True, loc=sub.loc))
+            self.block(sub.body)
+            self.emit(Ret(loc=sub.loc))
         return self.ops
+
+    def sub_depth(self, sub) -> int:
+        """How deep calls go below `sub`, counting only subs that would be routines."""
+        if sub not in self.depth:
+            self.depth[sub] = 0
+            inner = count_calls(sub.body, {})
+            self.depth[sub] = max((1 + self.sub_depth(s) for s in inner), default=0)
+        return self.depth[sub]
+
+    def as_routine(self, sub) -> bool:
+        # the return stack is 4 deep and circular (Finding 33): main -> 4 nested routines at most
+        return self.icm and self.calls.get(sub, 0) >= 2 and self.sub_depth(sub) <= 2
 
     def block(self, stmts):
         for s in stmts:
@@ -295,10 +344,7 @@ class Selector:
         self.emit(Label(end))
 
     def loop(self, s: N.Loop):
-        if s.count is None:
-            if not self.icm:
-                raise DmpError("while needs a backward jump, and the MPU-6050 has none", s.loc,
-                               "use `for _ in dmp.loop(N)`, which unrolls")
+        if s.count is None:                         # while: a backward branch on both cores
             end = self.scoped(s.label)
             top = self.new_label("top")
             self.emit(Label(top, loop_head=True))
@@ -333,7 +379,13 @@ class Selector:
         vals = [self.operand(a) for a in s.args]
         for p, v in zip(sub.params, vals):
             self.move(self.word(p), v)
-        self.block(sub.body)
+        if self.as_routine(sub):
+            if sub not in self.routines:
+                self.routines[sub] = self.new_label(f"sub.{sub.name}")
+                self.pending.append(sub)
+            self.emit(Call(self.routines[sub], loc=s.loc))
+        else:
+            self.block(sub.body)
         for o, r in zip(s.outs, sub.results):
             self.move(self.word(o), self.word(r))
 
@@ -435,8 +487,9 @@ class Selector:
         elif isinstance(e, N.Sum):
             self.sum_(dst, e, loc)
         elif isinstance(e, N.MinMax):
-            a, b = self.operand(e.a), self.operand(e.b)
-            self.select_cmp(dst, a, b, e, loc)
+            if not self.minmax_clamp(dst, e, loc):
+                a, b = self.operand(e.a), self.operand(e.b)
+                self.select_cmp(dst, a, b, e, loc)
         elif isinstance(e, N.Abs):
             a = self.operand(e.x)
             out = self.temp() if dst is a else dst
@@ -479,6 +532,54 @@ class Selector:
                     cur = nxt
         else:
             raise TypeError(type(e).__name__)
+
+    # ------------------------------------------------------------------ CLAMP (f5 op 0)
+    # r = A >= 0 ? min(A, B) : max(A, -B), -B exact: A clamped to [-B, B] (ISA2 Finding 41)
+    def interval(self, e):
+        if isinstance(e, N.Const):
+            return e.value, e.value
+        iv = self.intervals.get(id(e))
+        return iv if iv is not None else (MIN_WORD, -MIN_WORD - 1)
+
+    @staticmethod
+    def const_value(e):
+        while isinstance(e, N.Assume):
+            e = e.x
+        return e.value if isinstance(e, N.Const) else None
+
+    def minmax_clamp(self, dst, e: N.MinMax, loc) -> bool:
+        """Compile e to CLAMP where that is exact for every value the operands can take."""
+        top = -MIN_WORD - 1
+        # dmp.clamp(x, lo, hi) = min(max(x, lo), hi) with constant bounds
+        if e.op == "min" and isinstance(e.a, N.MinMax) and e.a.op == "max":
+            lo, hi = self.const_value(e.a.b), self.const_value(e.b)
+            if lo is not None and hi is not None and lo <= hi:
+                x = e.a.a
+                if lo == -hi:                      # symmetric: one CLAMP for every x
+                    self.emit(Alu("clamp", dst, self.operand(x), self.const(hi), loc=loc))
+                    return True
+                xl, xh = self.interval(x)
+                if (lo + hi) % 2 == 0:             # shift to symmetric: clamp(x - m, +-h) + m
+                    m, h = (lo + hi) // 2, (hi - lo) // 2
+                    if MIN_WORD <= xl - m and xh - m <= top:
+                        t = self.temp("clamp")
+                        self.emit(Alu("rsub", t, self.const(m), self.operand(x), loc=loc))   # x - m
+                        self.emit(Alu("clamp", t, t, self.const(h), loc=loc))
+                        self.emit(Alu("add", dst, t, self.const(m), loc=loc))
+                        return True
+        # min(x, c) / max(x, c) with a constant c, where x's range keeps CLAMP exact
+        for x, c in ((e.a, e.b), (e.b, e.a)):
+            cv = self.const_value(c)
+            if cv is None:
+                continue
+            xl, xh = self.interval(x)
+            if e.op == "min" and (xl >= 0 or (cv >= 0 and xl >= -cv)):
+                self.emit(Alu("clamp", dst, self.operand(x), self.const(cv), loc=loc))
+                return True
+            if e.op == "max" and cv > MIN_WORD and (xh < 0 or (cv <= 0 and xh <= -cv)):
+                self.emit(Alu("clamp", dst, self.operand(x), self.const(-cv), loc=loc))
+                return True
+        return False
 
     def select_cmp(self, dst, a, b, e: N.MinMax, loc):
         """dst := min(a, b) or max(a, b), by an exact compare (MIN's flag has no simple rule,

@@ -77,7 +77,7 @@ def asm(body, chip="mpu6050"):
 
 @pytest.mark.parametrize("body,msg", [
     ("add 0,1", "mode register is unknown"),                      # nothing set it at the entry
-    ("fmode 1\nmin 0,1", "min needs mode f5-f7"),
+    ("fmode 1\nmin 0,1", "clamp needs mode f5-f7"),
     ("fmode 5\nadd 0,1", "add needs mode f1-f3"),
     ("fmode 1\nmac 0,1", "mac needs mode f0"),
     ("fmode 1\nbranch far\n.org 0x500\nfar: end", "outside -32..31"),

@@ -10,9 +10,9 @@ u = v / |v| is computed as v * rsqrt(|v|^2):
 Unlike gyro_quat.py's single Newton step, this works for any |v|, including free fall and
 shocks.  The spin axis is only meaningful while the rotation is well above the gyro noise.
 
-The two targets compile this very differently, which the listings show.  On the ICM-20948 the
-loops are real backward jumps and unit() is one subroutine called twice.  On the MPU-6050 each
-loop is unrolled into a chain of forward exits and unit() is inlined twice: bigger, same result.
+The two targets compile this differently, which the listings show.  On the ICM-20948 unit() is
+one subroutine called twice; the MPU-6050 has no call, so there it is inlined twice.  On both, the
+loops are real backward branches (the MPU's reach 32 bytes, so its longer ones go through hops).
 
 Packet: gravity x, y, z, spin axis x, y, z and their cosine (q30), 28 B.
 Exercises: @dmp.sub, dmp.loop with break, an early return, multiple return values,

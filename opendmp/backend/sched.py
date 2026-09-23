@@ -16,8 +16,8 @@ from ..isa.core import Insn
 from ..lang.errors import DmpError
 from . import tac as T
 
-MODE = {"add": 1, "rsub": 1, "mul": 1, "nmul": 1, "min": 5, "and": 5, "xor": 5}
-COMMUTATIVE = {"add", "mul", "nmul", "min", "and", "xor"}
+MODE = {"add": 1, "rsub": 1, "mul": 1, "nmul": 1, "clamp": 5, "and": 5, "xor": 5}
+COMMUTATIVE = {"add", "mul", "nmul", "and", "xor"}
 WIDE = (0, 1, 5)                  # modes that move and clear whole words
 WIDE_MPU = (0, 1, 4, 5)           # the MPU's mode 4 (after any f4) moves and clears too (probe96)
 
@@ -32,6 +32,14 @@ class State:
 
     def copy(self):
         return State(list(self.p), self.p2i, self.mode, self.route, self.fresh)
+
+
+def known_in(a: State, b: State) -> bool:
+    """Everything a claims is also true in b (a is safe to assume where b holds)."""
+    return all(x is None or x == y for x, y in zip(a.p, b.p)) and \
+        (a.p2i is None or (a.p2i == b.p2i and a.p[2] == b.p[2])) and \
+        (a.mode is None or a.mode == b.mode) and (a.route is None or a.route == b.route) and \
+        (a.fresh is None or a.fresh == b.fresh)
 
 
 def join(a: State, b: State) -> State:
@@ -71,6 +79,10 @@ class Scheduler:
         self.loc = None
         self.group = False
         self.note = ""
+        self.heads: dict = {}      # loop head label -> the state assumed there
+        self.fall: dict = {}       # loop head label -> the state the code falling in brings
+        self.back: dict = {}       # loop head label -> [states the backward branches bring]
+        self.placed: set = set()   # labels already emitted
 
     # ------------------------------------------------------------------ output
     def put(self, op, *args, target=None):
@@ -134,7 +146,8 @@ class Scheduler:
         return (w.addr >> 2) & 3
 
     # ------------------------------------------------------------------ the pass
-    def run(self, ops):
+    def run(self, ops, heads=None):
+        self.heads = heads or {}
         if self.icm:
             self.set_mode(1, force=True)        # mode 4 may survive from the last pass
         self.put("always")
@@ -263,28 +276,77 @@ class Scheduler:
         st.mode = 4
         self.put("jump" if self.icm else "branch", label, target=label)
         self.st.mode = 4
-        self.arrivals.setdefault(label, []).append((st, conditional))
+        if label in self.placed:
+            self.back.setdefault(label, []).append(st)
+        else:
+            self.arrivals.setdefault(label, []).append((st, conditional))
 
     def label(self, op):
         arr = self.arrivals.pop(op.name, [])
         states = [s for s, _ in arr] + ([self.st] if self.reachable else [])
-        if op.loop_head or not states:
+        if not states:
             new = State()
         else:
             new = states[0].copy()
             for s in states[1:]:
                 new = join(new, s)
+        if op.loop_head:
+            # what the backward branches will bring is known only after the body: assume what
+            # the last round found (schedule() checks it and iterates), else nothing
+            self.fall[op.name] = new
+            new = self.heads.get(op.name, State()).copy()
+        if op.entry:
+            new = State()                   # a routine: reached from call sites in any state
+        self.placed.add(op.name)
         self.out.append(Emitted(None, label=op.name, safe=True, loc=self.loc))
         self.st, self.reachable = new, True
         self.group = False
-        if any(c for _, c in arr) or op.loop_head:
+        if any(c for _, c in arr) or op.loop_head or op.entry:
             self.put("always")
-        if self.icm and (arr or op.loop_head or self.st.mode in (None, 4)):
+        if self.icm and (arr or op.loop_head or op.entry or self.st.mode in (None, 4)):
             self.set_mode(1, force=True)
         self.group = True
+
+    def op_Call(self, op):
+        self.put("call", op.label, target=op.label)
+        self.st = State()                   # the routine may leave any pointer, route or mode
+
+    def op_Ret(self, op):
+        self.put("ret")
+        self.reachable = False
 
     def op_Irq(self, op):
         self.put("int")
 
     def op_End(self, op):
         self.put("end")
+
+
+def schedule(ops, chip: str, rounds: int = 6) -> list:
+    """Schedule `ops`, carrying pointer and mode state into loop heads where every way in agrees:
+    the code falling in and each backward branch.  The backward branches' states depend on what
+    the head assumed, so assume, schedule, check, and weaken the assumption until it holds; if it
+    never does, assume nothing at the heads."""
+    first = Scheduler(chip)
+    out = first.run(ops)
+    if not first.fall:
+        return out
+    heads = {}
+    for name, fall in first.fall.items():
+        h = fall
+        for b in first.back.get(name, []):
+            h = join(h, b)
+        heads[name] = h
+    for _ in range(rounds):
+        s = Scheduler(chip)
+        o = s.run(ops, heads)
+        actual = {}
+        for name, fall in s.fall.items():
+            h = fall
+            for b in s.back.get(name, []):
+                h = join(h, b)
+            actual[name] = h
+        if all(known_in(heads.get(n, State()), actual[n]) for n in actual):
+            return o
+        heads = {n: join(heads[n], actual[n]) if n in heads else actual[n] for n in actual}
+    return out

@@ -21,6 +21,7 @@ from .disasm import disasm
 
 
 UNKNOWN_F = object()      # F after an op whose flag rule is not measured
+UNKNOWN_LAST = object()   # what d1 would test after an op where that is not measured
 
 
 class Unmodelled(Exception):
@@ -346,7 +347,7 @@ class Machine:
 
     def _cond(self, b: int) -> bool:
         if self.f is UNKNOWN_F:
-            raise Unmodelled("a predicate reads F after MIN, which is not modelled (probe99)")
+            raise Unmodelled("a predicate reads F where its rule is not modelled")
         return (not self.f) if b == 0xDA else self.f
 
     # ------------------------------------------------------------------ execution
@@ -412,11 +413,14 @@ class Machine:
         if icm and self.mode == 4 and b < 0x80:   # a branch target with no f4 of its own [HW]
             return self._jump(b, m[pc + 1], pc + 2)
         if not icm and self.mode == 4 and b < 0x80:
-            # the MPU has DMP3's mode 4: after an f4 a low byte is not an ALU op but a two-byte
-            # jump, whose address mapping is not measured yet (probe97: 0c 20 and 14 20 went to
-            # 0x420, 04 20 did not) [HW]
-            raise Unmodelled(f"MPU byte {b:02x} in mode 4 (after an f4) at {pc:#06x}: a mode-4 jump; "
-                             "set the mode (f0-f7) after a branch")
+            # the MPU's mode 4: a byte below 0x40 is a one-byte branch, the f4's signed 6-bit
+            # displacement with the f4 implied: to pc + 1 + d, 10 cycles taken (ISA2 Finding 42,
+            # probe104; the vendor's eMD 6.12 images chain their hops with it)
+            if b < 0x40:
+                self.pc = pc + 1 + (b if b < 0x20 else b - 64)
+                return "branch1"
+            raise Unmodelled(f"MPU byte {b:02x} in mode 4 at {pc:#06x}: no branch and no interrupt "
+                             "(probe104), anything else unmeasured")
         self.pc = pc + 1
         if b < 0x80:
             return self._alu(b)
@@ -448,6 +452,8 @@ class Machine:
             self._adv(2)
             return "cheap"
         if b == 0xD1:                               # TEST: F := (last == 0)
+            if self.last is UNKNOWN_LAST:
+                raise Unmodelled("d1 after CLAMP: what it tests is not measured (probe103)")
             self.f = self.last == 0
             return "cheap"
         if 0xD2 <= b <= 0xD7:
@@ -556,15 +562,16 @@ class Machine:
                 r = self.acc
             self._flags(r < 0, r)
             key = "mac"
-        elif mode in (5, 6, 7):                     # MIN / CMP / AND / XOR [HW, probe70/86]
+        elif mode in (5, 6, 7):                     # CLAMP / CMP / AND / XOR [HW, probe70/86]
             a, b, w = self._lanes(a, b)
-            if k == 0:                              # MIN; d1 then tests b - a [HW, probe86]
-                d = b - a
-                if d >= 1 << (w - 1):
-                    r = -1                          # measured, unexplained (probe86 F, 4 cells)
-                else:
-                    r = min(a, b)
-                self._flags(UNKNOWN_F, d)           # no simple rule fits 16 cells (probe99)
+            if k == 0:                              # CLAMP A to [-B, B] (the vendor's "MIN")
+                x = min(a, b) if a >= 0 else max(a, -b)     # -B exact: B = -2.0 gives +2.0
+                r = x - (1 << w) if x >= 1 << (w - 1) else x
+                if r < -(1 << (w - 1)):
+                    r += 1 << w
+                # F := A was clamped (the exact result differs from A); what d1 then reads is
+                # unmeasured beyond one cell [HW, probe103: 1920 cells per part, lanes included]
+                self._flags(x != a, UNKNOWN_LAST)
                 key = "logic"
             elif k == 1:                            # "CMP": a sign test, not a compare, both
                 r, store = a - b, False             # cores: F := a < 0 and b >= 0 (probe98/99,
@@ -575,7 +582,7 @@ class Machine:
                 self._flags(None, 0)
                 key = "logic"
             if k == 0:
-                key = "min"
+                key = "clamp"
         else:
             a, b, _ = self._lanes(a, b)
             if k == 0:

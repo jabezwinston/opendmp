@@ -15,8 +15,9 @@ from ..isa.core import Insn, chip_name, cost_key, effect, encode
 from ..lang.errors import DmpError
 from ..q30 import MASK, ONE
 from . import tac as T
-from .layout import layout
-from .sched import Emitted, Scheduler
+from .layout import optimise
+from .opt import defs, optimize, uses
+from .sched import Emitted, Scheduler, schedule
 
 ENTRY = {"mpu6050": 0x0400, "icm20948": 0x1000}
 CODE_END = {"mpu6050": 0x0C00, "icm20948": 0x3000}     # MPU: end of RAM; ICM: the FIFO at 0x3000
@@ -60,6 +61,19 @@ class Build:
                           gx=h(w[2], 0), gy=h(w[2], 1), gz=h(w[3], 0))
         return Sample(ax=h(w[0], 0), ay=h(w[0], 1), az=h(w[1], 0), gx=h(w[1], 1),   # ax|ay az|gx
                       gy=h(w[2], 0), gz=h(w[2], 1), temp=h(w[3], 0))                 # gy|gz temp|-
+
+    @property
+    def bounded(self) -> bool:
+        """True when no instruction can run twice in a pass: no backward branch, no call.  Then
+        cycles_straight() is an upper bound on the pass."""
+        for e in self.out:
+            if e.insn is None:
+                continue
+            if e.insn.op == "call":
+                return False
+            if e.target is not None and self.labels[e.target] <= e.addr:
+                return False
+        return True
 
     def cycles_straight(self) -> int:
         """Every instruction once, the start latency included: an upper bound on a pass for
@@ -121,9 +135,14 @@ class Build:
         straight = self.cycles_straight()
         period = 1e6 / o["rate"]
         us = straight * chip.cycle_ns / 1000
-        lines.append(f"; pass   {self.size} B of code; at most {straight} cycles = {us:.1f} us after the tick "
-                     f"({100 * us / period:.1f} % of {period:.0f} us)"
-                     + (f"; {self.hops} branch hops" if self.hops else ""))
+        if self.bounded:
+            lines.append(f"; pass   {self.size} B of code; at most {straight} cycles = {us:.1f} us after the "
+                         f"tick ({100 * us / period:.1f} % of {period:.0f} us)"
+                         + (f"; {self.hops} branch hops" if self.hops else ""))
+        else:
+            lines.append(f"; pass   {self.size} B of code; every instruction once: {straight} cycles = "
+                         f"{us:.1f} us; loops and calls run longer (the emulator counts them)"
+                         + (f"; {self.hops} branch hops" if self.hops else ""))
         return "\n".join(lines)
 
     def text(self, e):
@@ -185,7 +204,8 @@ class Build:
                 "symbols": {w.name: {"addr": w.addr, "kind": w.kind, "type": w.var.type if w.var else None,
                                      "init": w.init} for w in self.words
                             if w.kind in ("state", "param")},
-                "code_size": self.size, "cycles_max": self.cycles_straight()}
+                "code_size": self.size, "cycles_once": self.cycles_straight(),
+                "cycles_max": self.cycles_straight() if self.bounded else None}
 
     def write(self, directory, stem=None) -> list:
         d = pathlib.Path(directory)
@@ -202,9 +222,11 @@ class Build:
 
 def size_of(e: Emitted, chip) -> int:
     op = e.insn.op
+    if op == "branch.m4":
+        return 1
     if op == "branch":
         return 2
-    if op == "jump":
+    if op in ("jump", "call"):
         return 3
     return len(encode(e.insn, chip))
 
@@ -234,6 +256,9 @@ def assemble(out: list, chip: str, entry: int):
     a target far away costs one hop every ~60 bytes, not one per branch."""
     icm = chip == "icm20948"
     for e in out:
+        # in mode 4 (after any f4) an MPU branch is one byte: the f4 is implied (Finding 42)
+        if not icm and e.insn is not None and e.insn.op == "branch" and e.mode == 4:
+            e.insn = Insn("branch.m4", e.insn.args)
         e.size = 0 if e.insn is None else size_of(e, chip)
     hops = 0
     hop_target: dict = {}                      # hop label -> the label it continues to
@@ -249,7 +274,7 @@ def assemble(out: list, chip: str, entry: int):
         far = None
         for i, e in enumerate(out):
             if e.target is not None:
-                d = labels[e.target] - (e.addr + 2)
+                d = labels[e.target] - (e.addr + e.size)
                 if not -32 <= d <= 31:
                     far = i
                     break
@@ -258,12 +283,12 @@ def assemble(out: list, chip: str, entry: int):
         e = out[far]
         final = hop_target.get(e.target, e.target)
         back = labels[e.target] < e.addr
-        lo_reach, hi_reach = e.addr + 2 - 32, e.addr + 2 + 31
+        lo_reach, hi_reach = e.addr + e.size - 32, e.addr + e.size + 31
         shared = [h for h, t in hop_target.items() if t == final and lo_reach <= labels[h] <= hi_reach
-                  and (labels[h] < e.addr if back else labels[h] > e.addr + 2)]
+                  and (labels[h] < e.addr if back else labels[h] > e.addr + e.size)]
         if shared:                         # the hop to the same target that gets furthest
             e.target = (min if back else max)(shared, key=lambda h: labels[h])
-            e.insn = Insn("branch", (e.target,))
+            e.insn = Insn(e.insn.op, (e.target,))
             continue
         if back:                           # a hop at the earliest safe point it can reach, allowing
             # for the 5 bytes the hop itself adds between it and the branch
@@ -279,10 +304,10 @@ def assemble(out: list, chip: str, entry: int):
         hop, over = f"hop.{hops}", f"over.{hops}"
         loc = out[j].loc
         m = mode_at(out, j)
-        ins = [Emitted(Insn("branch", (over,)), target=over, safe=True, loc=loc,
-                       note="step over the hop", mode=m),
+        ins = [Emitted(Insn("branch.m4" if m == 4 else "branch", (over,)), target=over, safe=True,
+                       loc=loc, note="step over the hop", mode=m),
                Emitted(None, label=hop, loc=loc),
-               Emitted(Insn("branch", (final,)), target=final, loc=loc,
+               Emitted(Insn("branch.m4", (final,)), target=final, loc=loc,     # one byte: mode 4
                        note=f"hop on to {final}", mode=4),
                Emitted(None, label=over, loc=loc)]
         if m not in (None, 4):             # the step-over f4 left mode 4: restore what was in force
@@ -293,7 +318,7 @@ def assemble(out: list, chip: str, entry: int):
         out[j:j] = ins
         hop_target[hop] = final
         e.target = hop
-        e.insn = Insn("branch", (hop,))
+        e.insn = Insn(e.insn.op, (hop,))
     else:
         raise DmpError("internal: branch relaxation did not settle")
     code = bytearray()
@@ -310,9 +335,10 @@ def build(program, chip, trace: bool = False) -> Build:
     chip = chip_name(chip)
     ir = program.ir
     sel = T.Selector(ir, chip, trace)
-    ops = sel.run()
-    words = layout(sel.words, chip)
-    out = Scheduler(chip).run(ops)
+    ops = optimize(sel.run())
+    used = {id(w) for op in ops for w in uses(op) + defs(op)}
+    words = optimise([w for w in sel.words if id(w) in used or w.kind in ("state", "param")], ops, chip)
+    out = schedule(ops, chip)
     entry = ENTRY[chip]
     code, labels, hops = assemble(out, chip, entry)
     if entry + len(code) > CODE_END[chip]:

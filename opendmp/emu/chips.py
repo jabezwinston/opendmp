@@ -18,9 +18,9 @@ from dataclasses import dataclass, field
 # "skip" per BYTE [HW both].  Unmeasured keys fall back along this chain.
 FALLBACK = {
     "page": "cheap", "skip": "cheap", "int": "cheap", "halt": "cheap", "int2": "cheap",
-    "call": "branch", "ret": "cheap", "branch": "cheap",
+    "call": "branch", "ret": "cheap", "branch": "cheap", "branch1": "branch",
     "movx": "mov", "clr": "mov", "sload": "mov", "lo": "clr",
-    "add16": "add", "mul16": "mul", "mac": "mul", "min": "add", "logic": "add", "cmp": "add",
+    "add16": "add", "mul16": "mul", "mac": "mul", "clamp": "add", "logic": "add", "cmp": "add",
     "inc": "add", "shift": "add", "fccmp": "add",
 }
 
@@ -80,6 +80,7 @@ _MPU = {
     "page": 5,      # 0.610: 87
     "skip": 5,      # 0.610 per byte (40 and c0 under a false d9; f4 00 skipped = 10)
     "branch": 15,   # 1.830: f4 00 and f4 01, taken; the bytes jumped over cost nothing
+    "branch1": 10,  # 1.220: a one-byte branch in mode 4, taken (probe104; skipped: 5)
     "clr": 12,      # 1.464: de, df
     "cmp": 17,      # 2.073: f5 01
     "mov": 18, "movx": 18,   # 2.195: c0 c1 c8, to RAM or the FIFO
@@ -87,7 +88,7 @@ _MPU = {
     "logic": 23,    # 2.805: f5 02
     "inc": 23,      # 2.805: f8
     "add": 28,      # 3.415: 40 41 44 (RAM or FIFO)
-    "min": 28,      # 3.415: f5 00
+    "clamp": 28,    # 3.415: f5 00
     "mul16": 52,    # 6.342: 42 under f3
     "mul": 58,      # 7.073: 42 43
     "mac": 60,      # 7.317: 00 under f0
@@ -110,7 +111,7 @@ _ICM = {
     "inc": 21,      # 1.002: f8
     "mul": 25,      # 1.193: 42
     "add": 26,      # 1.241: 40 41
-    "min": 26,      # 1.241: f5 00
+    "clamp": 26,    # 1.241: f5 00
     "mac": 27,      # 1.288: f0 00
 }
 

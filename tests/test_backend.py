@@ -89,3 +89,29 @@ def test_trace_build_carries_its_samples(chip):
     assert [b.trace_sample(pk) for pk in emu.packets] == s
     ref = p.simulate(s)
     assert [pk[b.trace_bytes:] for pk in emu.packets] == ref.packets
+
+
+WHILE_SRC = '''
+import opendmp as dmp
+
+@dmp.program(rate=100)
+def w(s):
+    n = 0
+    x = s.accel.x * 0.5
+    while x < 0.25:                  # data-dependent trips: a backward branch on both cores
+        x = x + 0.0625
+        n += 1
+    k = 0
+    while k < 40:                    # a body the MPU's 32-byte reach needs no hop for
+        k += 1
+        x = x * 0.99
+    dmp.emit(n=n, x=x)
+'''
+
+
+@pytest.mark.parametrize("chip", CHIPS)
+def test_while_on_both_cores(tmp_path, chip):
+    f = tmp_path / "w.py"
+    f.write_text(WHILE_SRC)
+    p = runpy.run_path(str(f))["w"]
+    check(p, chip, generate(["shake", "walk", "tilt"], rate=100, seconds=0.5))
