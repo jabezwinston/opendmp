@@ -1,0 +1,13 @@
+# python -m opendmp.emu tilt.toml
+chip = "mpu6050"
+rate = 200
+sensors = "tilt_walk.csv"          # python -m opendmp.emu.gen tilt,walk,rotate --rate 200 -o tilt_walk.csv
+units = "raw"
+load = ["tilt.asm"]                # opendmp assembly: places its code and data itself
+# the dmpasm variant: load = ["tilt.s@0x400"], entry = 0x400,
+#   poke = ["0x100=0.0873q,1.0q,0.98q,0.02q", "0x110=0,0,0,0", "0x120=0.25q"]
+watch = ["0x11c"]                  # angle
+log = "out/tilt_passes.csv"
+fifo = "out/tilt.fifo"
+trace = "out/tilt_trace.txt"
+trace_passes = 1
