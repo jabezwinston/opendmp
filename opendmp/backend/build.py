@@ -529,7 +529,62 @@ def build(program, chip, trace: bool = False) -> Build:
     image[entry:entry + len(code)] = code
     b = Build(program, ir, chip, entry, image, code, out, words, labels, hops, hop_target, trace=trace)
     b.notes = _merge_notes(ir.notes + sel.notes + asm_notes)
+    if not _COSTING:
+        b.notes = [(loc, _with_cost(text, chip)) for loc, text in b.notes]
     return b
+
+
+_COSTING = False
+_ROUTINE_COST: dict = {}
+
+
+def _routine_cost(name: str, chip: str) -> int:
+    """The most cycles one call of a library routine adds to a pass: the bound of a program that
+    makes the call, less that of one that does not."""
+    global _COSTING
+    key = (name, chip)
+    if key not in _ROUTINE_COST:
+        import textwrap
+        import tempfile
+        from ..api import Program
+        expr = {"div": "x / y", "idiv": "n // m"}[name]
+        src = textwrap.dedent(f"""
+            import opendmp as dmp
+
+            @dmp.program(rate=50)
+            def cost(s):
+                x: dmp.param = 0.5
+                y: dmp.param = 0.25
+                n: dmp.param = 100
+                m: dmp.param = 7
+                dmp.emit(r={{}})
+            """)
+        costs = []
+        _COSTING = True
+        try:
+            for body in (expr, "x" if name == "div" else "n"):
+                with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
+                    f.write(src.format(body))
+                try:
+                    ns = {}
+                    exec(compile(open(f.name).read(), f.name, "exec"), ns)
+                    prog = next(v for v in ns.values() if isinstance(v, Program))
+                    costs.append(build(prog, chip).cycles_max())
+                finally:
+                    pathlib.Path(f.name).unlink()
+        finally:
+            _COSTING = False
+        _ROUTINE_COST[key] = costs[0] - costs[1]
+    return _ROUTINE_COST[key]
+
+
+def _with_cost(text: str, chip: str) -> str:
+    for tag, name in (("(dmp.div)", "div"), ("(dmp.idiv)", "idiv")):
+        if tag in text:
+            c = _routine_cost(name, chip)
+            us = c * get_chip(chip).cycle_ns / 1000
+            return text + f"; costs up to {c} cycles = {us:.0f} us each"
+    return text
 
 
 def _merge_notes(notes):

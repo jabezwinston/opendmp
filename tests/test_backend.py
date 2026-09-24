@@ -199,6 +199,7 @@ def test_method_notes():
     assert any("at most 15 trips" in l for l in uv.build("mpu6050").explain())
     sl = program(next(x for x in EXAMPLES if x.stem == "slope")).build("mpu6050")
     assert any("x / y (dmp.div): exact restoring division" in l for l in sl.explain())
+    assert any("dmp.div" in l and "costs up to" in l and " us each" in l for l in sl.explain())
     assert not any("lib.py" in l for l in sl.explain())            # the library's insides stay hidden
     bq = program(next(x for x in EXAMPLES if x.stem == "biquad")).build("icm20948")
     assert sum("biquad(): a helper, inlined here" in l for l in bq.explain()) == 1   # merged

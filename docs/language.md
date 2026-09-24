@@ -255,7 +255,8 @@ These are the kinds of note:
 - **Assembly:** branches that need hops.
 
 `Build.notes` has them as `(location, text)`, and `Build.explain()` as lines. A library function
-is summarised at its call site (`dmp.div: exact restoring division ...`), not line by line.
+is summarised at its call site, with the most cycles one call adds (`x / y (dmp.div): exact
+restoring division ...; costs up to 10441 cycles = 1273 us each` on the MPU), not line by line.
 
 ## 12. How it compiles
 
