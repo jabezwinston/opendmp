@@ -233,7 +233,7 @@ The twelve programs in `examples/` each exercise something:
 | quaternions, `dmp.quat`, cross products | `mahony.py`, `gyro_quat.py` |
 | params with ranges, saturation | `pid_level.py` |
 | `@dmp.sub`, `dmp.loop` with `break`, early `return` | `unit_vectors.py` |
-| division: `dmp.div`, exact for every input | `slope.py` |
+| division: `x / y` (Q30, exact), `n // m` (Int, floor) | `slope.py`; `docs/language.md` §5 |
 | the FSYNC input: `s.fsync` counts edges on the sync line | `language.md` §3 |
 
 **Loops.**
@@ -252,8 +252,8 @@ return); the MPU inlines it. Plain helper `def`s are always inlined.
 - **Prefer weighted forms for filters.** Write `(1-a)*y + a*x`, not `y + a*(x - y)`, whose
   difference can reach 4 and wrap before it is scaled.
 - **Clamp symmetrically when you can.** `dmp.clamp(x, -c, c)` is a single instruction.
-- **Divide by constants when you can.** `x / C` is one multiply; `dmp.div(x, y)` is exact but
-  costs about 1.3 ms on the MPU.
+- **Divide by constants when you can.** `x / C` is one multiply; `x / y` is exact but costs
+  about 1.3 ms on the MPU.
 - **Declare a range on every state that feeds back into itself**, and clamp it where a real input
   can push it out.
 - **Emit at the end of the pass, unconditionally**: packets have a fixed length.

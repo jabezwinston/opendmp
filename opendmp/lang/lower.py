@@ -856,9 +856,10 @@ class Lowerer:
             return self.fold(node)
         if isinstance(op, ast.Pow):
             raise self.err("** is not supported on DMP values", node, "write x * x")
-        if isinstance(op, (ast.FloorDiv, ast.Mod)):
-            raise self.err(f"{'//' if isinstance(op, ast.FloorDiv) else '%'} is not supported on DMP values",
-                           node, HINT_DIV if isinstance(op, ast.FloorDiv) else None)
+        if isinstance(op, ast.FloorDiv):
+            return self.floor_divide(node)
+        if isinstance(op, ast.Mod):
+            raise self.err("% is not supported on DMP values", node, "n - (n // m) * m, with Int values")
         if isinstance(op, ast.MatMult):
             raise self.err("@ is not supported", node)
         if isinstance(op, (ast.BitAnd, ast.BitXor, ast.BitOr)):
@@ -926,7 +927,8 @@ class Lowerer:
             return
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
             if not self.is_static(node.right):
-                raise self.err("division by a variable: the DMP has no divide", node, HINT_DIV)
+                terms.append((coef, "val", self.divide(node), node))
+                return
             c = self.fold(node.right)
             if not is_number(c) or c == 0:
                 raise self.err(f"division by {node_text(node.right)}", node.right)
@@ -1255,6 +1257,32 @@ class Lowerer:
         if isinstance(r, list):
             return [self.load_result(x, node) for x in r]
         return N.Load(r, loc=self.loc(node))
+
+    def divide(self, node):
+        """x / y with y a DMP value: a call of dmp.div (exact restoring division, opendmp/lib.py),
+        the same call the reference makes, so every engine gets the same bits."""
+        from .. import lib
+        call = ast.copy_location(ast.Call(func=ast.Name("div", ast.Load()), args=[node.left, node.right],
+                                          keywords=[]), node)
+        ast.fix_missing_locations(call)
+        vals = [self.expr(node.left), self.expr(node.right)]
+        for v, an in zip(vals, call.args):
+            if isinstance(v, list) or N.arith_type(self.value(v, an).type) != N.Q30:
+                raise self.err("/ divides Q30 values", an, "Int values do not divide (counters count)")
+        return self.call_sub(lib.div, vals, call)
+
+    def floor_divide(self, node):
+        """n // m with Int values: a call of dmp.idiv (floor division, opendmp/lib.py)."""
+        from .. import lib
+        call = ast.fix_missing_locations(ast.copy_location(
+            ast.Call(func=ast.Name("idiv", ast.Load()), args=[node.left, node.right], keywords=[]), node))
+        vals = [self.expr(node.left), self.expr(node.right)]
+        for v, an in zip(vals, call.args):
+            if isinstance(v, list) or N.arith_type(self.value(v, an).type) != N.INT:
+                raise self.err("// divides Int values (floor division)", an,
+                               "for Q30 values write x / y, which is exact")
+        out = self.call_sub(lib.idiv, vals, call)
+        return out
 
     def call_sub(self, s, args, node):
         fn = s.fn

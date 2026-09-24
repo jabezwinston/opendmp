@@ -198,8 +198,38 @@ def test_method_notes():
     assert any("unit(): inlined here (the MPU has no call)" in l for l in uv.build("mpu6050").explain())
     assert any("at most 15 trips" in l for l in uv.build("mpu6050").explain())
     sl = program(next(x for x in EXAMPLES if x.stem == "slope")).build("mpu6050")
-    assert any("dmp.div: exact restoring division" in l for l in sl.explain())
+    assert any("x / y (dmp.div): exact restoring division" in l for l in sl.explain())
     assert not any("lib.py" in l for l in sl.explain())            # the library's insides stay hidden
     bq = program(next(x for x in EXAMPLES if x.stem == "biquad")).build("icm20948")
     assert sum("biquad(): a helper, inlined here" in l for l in bq.explain()) == 1   # merged
     assert "  ;   -> `" in tilt.listing()
+
+
+FLOORDIV_SRC = '''
+import opendmp as dmp
+
+@dmp.program(rate=50)
+def fd(s):
+    n: dmp.param = 0
+    m: dmp.param = 1
+    dmp.emit(q=n // m)
+'''
+
+
+def test_floor_division_matches_python(tmp_path):
+    """n // m on Int values: Python's floor division for every 32-bit pair; // 0 and the one
+    overflow (-2^31 // -1) saturate."""
+    f = tmp_path / "fd.py"
+    f.write_text(FLOORDIV_SRC)
+    p = runpy.run_path(str(f))["fd"]
+    L = 1 << 31
+    edge = [-L, -L + 1, -7, -2, -1, 0, 1, 2, 3, 7, L - 1]
+    builds = [p.build(c) for c in CHIPS]
+    for a in edge:
+        for b in edge:
+            want = (L - 1 if a >= 0 else -L) if b == 0 else min(a // b, L - 1)
+            ref = p.simulate([Sample()], params={"n": a, "m": b})
+            assert int.from_bytes(ref.packets[0], "big", signed=True) == want, (a, b)
+            for bd in builds:
+                assert bd.emulate([Sample()], params={"n": a, "m": b}).packets == ref.packets, (a, b)
+    assert any("n // m (dmp.idiv): exact floor division" in l for l in builds[0].explain())

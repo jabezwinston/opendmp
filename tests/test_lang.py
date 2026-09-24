@@ -238,7 +238,7 @@ def test_range_warning_names_the_fix(mk):
 
 # ------------------------------------------------------------------ what is refused
 REJECTS = [
-    ("x = s.accel.x / s.accel.y\ndmp.emit(x=x)", "division by a variable", "dmp.div"),
+    ("n: dmp.state = 3\nm = n / n\ndmp.emit(m=m)", "/ divides Q30 values", "counters"),
     ("x = math.sqrt(s.accel.x)\ndmp.emit(x=x)", "needs constant arguments", "Newton"),
     ("x = s.accel.x ** 2\ndmp.emit(x=x)", "** is not supported", "x * x"),
     ("h: dmp.state = [0.0, 0.0]\nfor _ in dmp.loop(2):\n    x = h[_]\ndmp.emit(h0=h[0])",
@@ -316,12 +316,12 @@ def test_program_signature(mk):
 
 
 def test_error_points_at_the_construct(mk):
-    p = mk("x = s.accel.x + s.accel.y / s.accel.z\ndmp.emit(x=x)")
+    p = mk("x = s.accel.x + s.accel.y ** s.accel.z\ndmp.emit(x=x)")
     with pytest.raises(DmpError) as e:
         p.ir
     loc = e.value.loc
-    assert (loc.line, loc.col) == (7, 20)              # the division, not the whole line
-    assert str(e.value).splitlines()[2].strip() == "^" * len("s.accel.y / s.accel.z")
+    assert (loc.line, loc.col) == (7, 20)              # the power, not the whole line
+    assert str(e.value).splitlines()[2].strip() == "^" * len("s.accel.y ** s.accel.z")
 
 
 def test_program_object():
@@ -353,7 +353,7 @@ def test_cli(tmp_path, capsys):
     assert main(["ir", str(ex / "taps.py")]) == 0
     assert "emit event=event" in capsys.readouterr().out
     bad = tmp_path / "bad.py"
-    bad.write_text("import opendmp as dmp\n\n@dmp.program(rate=10)\ndef p(s):\n    dmp.emit(x=s.accel.x / s.gyro.x)\n")
+    bad.write_text("import opendmp as dmp\n\n@dmp.program(rate=10)\ndef p(s):\n    dmp.emit(x=s.accel.x ** s.gyro.x)\n")
     assert main(["check", str(bad)]) == 1
     err = capsys.readouterr().err
-    assert "bad.py:5:16: error: division by a variable" in err and "hint:" in err
+    assert "bad.py:5:16: error: ** is not supported" in err and "hint:" in err

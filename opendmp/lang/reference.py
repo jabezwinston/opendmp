@@ -354,6 +354,12 @@ class Reference:
                 return fo.fold(node.left) * self.ev(node.right, fr)
             if isinstance(op, (ast.Add, ast.Sub, ast.Mult, ast.Div)):
                 return self.linear(node, fr)
+            if isinstance(op, ast.FloorDiv) and not fo.is_static(node):
+                from .. import lib             # n // m: the library's floor division, as lowered
+                call = ast.fix_missing_locations(ast.copy_location(
+                    ast.Call(func=ast.Name("idiv", ast.Load()), args=[node.left, node.right], keywords=[]), node))
+                return self.run_function(lib.idiv.fn, [self.ev(node.left, fr), self.ev(node.right, fr)],
+                                         call, fr, sub=True)
             if isinstance(op, (ast.BitAnd, ast.BitXor, ast.BitOr)):
                 a = self.bits_raw(self.ev(node.left, fr))
                 b = self.bits_raw(self.ev(node.right, fr))
@@ -460,6 +466,14 @@ class Reference:
             sb, fb = self.unneg(node.right)
             a, b = self.factor(fa, fr), self.factor(fb, fr)
             out.append((coef * sa * sb, "prod", (a, b)))
+            return
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div) and not fo.is_static(node.right):
+            from .. import lib                 # x / y: the library's exact division, as lowered
+            call = ast.fix_missing_locations(ast.copy_location(
+                ast.Call(func=ast.Name("div", ast.Load()), args=[node.left, node.right], keywords=[]), node))
+            v = self.run_function(lib.div.fn, [self.ev(node.left, fr), self.ev(node.right, fr)],
+                                  call, fr, sub=True)
+            out.append((coef, "val", v))
             return
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
             c = fo.fold(node.right)

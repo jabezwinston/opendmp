@@ -109,8 +109,9 @@ What the compiler does (PLAN.md §6):
   and in mode 4 (after any branch) a branch is one byte (ISA2 Finding 42), as in the vendor's
   own eMD code. The ICM has 16-bit jumps.
 - **Subs**: on the ICM a `@dmp.sub` called more than once is one routine (`call`/`ret`).
-- **Division**: `x / C` is a multiply; `dmp.div(x, y)` is exact restoring division, written in
-  the language (`opendmp/lib.py`), for every input.
+- **Division**: `x / C` is a multiply; `x / y` is exact restoring division (`dmp.div`) and
+  `n // m` on Int values is Python's floor division (`dmp.idiv`), both written in the language
+  (`opendmp/lib.py`) and exact for every input.
 - **Sums without products** are ADD/RSUB chains: the same value modulo 2³², cheaper than a MAC
   run.
 - **Clean-up and layout.** Copy propagation and dead-store elimination run over the
@@ -132,7 +133,7 @@ What the compiler does (PLAN.md §6):
 | mahony | 190 | 4,575 | 221 | 2,668 | 16 |
 | despike | 341 | 3,094 | 383 | 2,705 | 12 |
 | unit_vectors | 359 | 15,780 | 261 | 11,099 | 28 |
-| slope (`dmp.div`) | 266 | 10,679 | 287 | 8,724 | 8 |
+| slope (`x / y`) | 266 | 10,679 | 287 | 8,724 | 8 |
 
 Cycles are the emulator's on walking and shaking motion. `opendmp build` also lists, per
 construct and line, the method it chose (`docs/language.md` §11). Every build also carries an

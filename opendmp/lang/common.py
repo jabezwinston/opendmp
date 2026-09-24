@@ -105,7 +105,7 @@ def module_attr(base, attr, err):
         if attr == "quat":
             from .. import quat
             return quat
-        if attr == "div":                   # the standard library, written in the language
+        if attr in ("div", "idiv"):         # the standard library, written in the language
             from .. import lib
             return getattr(lib, attr)
         if attr in ("state", "param"):

@@ -400,9 +400,11 @@ class Selector:
         vals = [self.operand(a) for a in s.args]
         for p, v in zip(sub.params, vals):
             self.move(self.word(p), v)
-        what = ("dmp.div: exact restoring division (the integer bit, then 30 fraction bits, "
-                "saturating); " if sub.loc is not None and library_file(sub.loc.file) and sub.name == "div"
-                else f"{sub.name}(): ")
+        lib = sub.loc is not None and library_file(sub.loc.file)
+        what = ("x / y (dmp.div): exact restoring division (the integer bit, then 30 fraction bits, "
+                "saturating); " if lib and sub.name == "div" else
+                "n // m (dmp.idiv): exact floor division of Int values (32 steps, as Python's //); "
+                if lib and sub.name == "idiv" else f"{sub.name}(): ")
         if self.as_routine(sub):
             if sub not in self.routines:
                 self.routines[sub] = self.new_label(f"sub.{sub.name}")

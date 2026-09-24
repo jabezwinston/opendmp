@@ -106,8 +106,9 @@ h: dmp.state = [0.0] * 4           # lists, nested lists: one word per element
 |---|---|
 | `a + b`, `a - b`, `-a` | see the exact-sum rule below |
 | `a * b` | Q30 × Q30, floored; Int × constant integer |
-| `x / C`, `x * (1 / C)` | a constant C only: a multiply by the reciprocal |
-| `dmp.div(x, y)` | x / y for any Q30 values: truncated toward zero, exact to the last bit, saturating at ±(2 − 2⁻³⁰) when the quotient reaches 2 or y is 0 |
+| `x / y` | Q30 values: truncated toward zero, exact to the last bit, saturating at ±(2 − 2⁻³⁰) when the quotient reaches 2 or y is 0. It compiles to `dmp.div(x, y)` (below), which is also callable by that name |
+| `x / C`, `x * (1 / C)` | C a constant: a multiply by the reciprocal, rounded to Q30 (one MUL, not exact division) |
+| `n // m` | Int values: floor division exactly as Python's, for every 32-bit pair. `n // 0` and the one overflow, −2³¹ // −1, saturate at the Int limits. It compiles to `dmp.idiv(n, m)` (32 steps; about 2.7 ms on the MPU, 0.9 ms on the ICM) |
 | `x * 2**k`, `x << k` on Bits | doublings; `>>` on Bits |
 | `abs(x)` | `abs(-2.0)` wraps to −2.0 |
 | `min(a, b)`, `max(a, b)` | exact |
@@ -198,7 +199,7 @@ def unit(x, y, z):
 `dmp.quat` has quaternion helpers written in this language: `gravity(q)`, `rate_step(q, h)` and
 `normalize(q)`.
 
-`dmp.div(x, y)` is written in this language too (`opendmp/lib.py`). It is restoring long
+`x / y`, that is `dmp.div(x, y)`, is written in this language too (`opendmp/lib.py`). It is restoring long
 division: the integer bit, then 30 fraction bits, one compare and subtract each. It works on
 −|x| and −|y|, which always fit (|−2.0| would not), so it is exact for every input. Because it is
 compiled from its source, every engine, silicon included, computes the same bits. It is a
@@ -209,7 +210,8 @@ It costs about 10,700 cycles on the MPU (1.3 ms) and 8,700 on the ICM (0.4 ms) a
 
 | construct | hint |
 |---|---|
-| `x / y`, y a variable | `dmp.div(x, y)`: exact division, written out as the DMP does it |
+| `n / m` on Int values, `x // y` on Q30 values | `/` divides Q30 values, `//` divides Int values |
+| `%` | `n - (n // m) * m` |
 | `math.sqrt(x)` of a DMP value, `x ** 2` | a Newton step; `x * x` |
 | a list index that is not a constant | unroll with `range(N)`; there is no indirect addressing |
 | a helper that calls itself | helpers are inlined |
@@ -269,7 +271,7 @@ is summarised at its call site (`dmp.div: exact restoring division ...`), not li
 | `dmp.loop`, `while` | a counter or a condition, and a branch back |
 | `n += 1` on an Int | one INC |
 | a sum with no products (`a + b - c`, `r + r - b`) | a chain of ADD/RSUB: the same value modulo 2³² |
-| `dmp.div(x, y)` | the library routine (above) |
+| `x / y` (`dmp.div`), `n // m` (`dmp.idiv`) | the library routines (above) |
 
 **The pass-time bound.** A build computes an upper bound on a pass
 (`build.cycles_max()`, the listing's last line and the `.json`):
