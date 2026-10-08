@@ -97,6 +97,8 @@ class PassResult:
     index: int = 0            # pass number, set by the scheduler
     sample: int = 0           # sample row this pass saw
     start_ns: float = 0.0
+    ticks: int = 0            # later sample ticks that landed inside this pass (run_pass(ticks=))
+    stall_cycles: int = 0     # the MPU's stall for those sample writes
 
 
 def _i16(v: int) -> int:
@@ -139,6 +141,7 @@ class Machine:
         self.sp = 0
         self.fifo = bytearray()
         self._fifo_wr = 0         # bytes written since the FIFO reset (where the next one lands)
+        self.fifo_lost = 0        # bytes an overflow discarded (the oldest)
         self.ints = 0
         self.pc = self.entry
         self.halted = False
@@ -212,14 +215,25 @@ class Machine:
         self.pc = self.entry
         self.halted = False
 
-    def run_pass(self, sample: Sample | None = None) -> PassResult:
+    def run_pass(self, sample: Sample | None = None, ticks=None) -> PassResult:
+        """One pass, from the sample tick to `end`.  `ticks`, if given, is the later sample ticks
+        in order, as (cycles after this pass's tick, Sample): the hardware rewrites the sample
+        page at each one even under a running pass, and on the MPU each such write stalls the
+        pass [HW, InvensenseDMP Finding 47; Finding 38]."""
         self.begin_pass(sample)
-        f0, i0 = len(self.fifo), self.ints
+        w0, i0 = self._fifo_wr, self.ints
         costs: Counter = Counter()
         chip = self.chip
         cyc = chip.start_cycles
-        steps = 0
+        steps = stall = seen = 0
+        later = iter(ticks) if ticks is not None else iter(())
+        nxt = next(later, None)
         while not self.halted:
+            while nxt is not None and cyc + stall >= nxt[0]:
+                self.write_sample(nxt[1])
+                stall += chip.tick_stall_cycles
+                seen += 1
+                nxt = next(later, None)
             key = self.step()
             costs[key] += 1
             cyc += chip.cyc(key) * (self._skip_len if key == "skip" else 1)
@@ -227,7 +241,10 @@ class Machine:
             if steps > self.model.max_steps:
                 raise DmpFault(f"pass did not halt within {self.model.max_steps} instructions "
                                f"(pc={self.pc:#06x}); the real DMP would stop serving samples")
-        return PassResult(bytes(self.fifo[f0:]), cyc * chip.cycle_ns, steps, self.ints - i0, costs, cyc)
+        n = self._fifo_wr - w0                       # this pass's bytes (the FIFO keeps the newest)
+        fifo = bytes(self.fifo[len(self.fifo) - min(n, len(self.fifo)):]) if n else b""
+        return PassResult(fifo, (cyc + stall) * chip.cycle_ns, steps, self.ints - i0, costs, cyc,
+                          ticks=seen, stall_cycles=stall)
 
     def drain_fifo(self) -> bytes:
         out = bytes(self.fifo)
@@ -309,13 +326,18 @@ class Machine:
         return ""
 
     def _fifo_put(self, data: bytes, at: int | None = None):
-        """Emit to the FIFO.  On DMP3 the FIFO is DMP RAM from 0x3000, filled in order from a
-        FIFO reset [HW, probe91], so an emit also lands there (and would clobber code placed
-        there); the wrap at 4 KB is INFER (stream mode overwrites the oldest bytes)."""
+        """Emit to the FIFO.  It holds `chip.fifo_size` bytes and keeps the newest: an overflow
+        loses the oldest [HW, InvensenseDMP Finding 52].  On DMP3 the FIFO is DMP RAM from 0x3000,
+        a ring filled in order from a FIFO reset [HW, probe91, probe114], so an emit also lands
+        there (and would clobber code placed there)."""
         if at is None:
             at = self._fifo_wr
             self.fifo += data
             self._fifo_wr += len(data)
+            over = len(self.fifo) - self.chip.fifo_size
+            if over > 0:
+                del self.fifo[:over]
+                self.fifo_lost += over
         else:
             self.fifo[len(self.fifo) - len(data):] = data
         base = self.chip.fifo_base
@@ -327,6 +349,7 @@ class Machine:
         """The host's FIFO reset: empty it and restart the fill at the base."""
         self.fifo.clear()
         self._fifo_wr = 0
+        self.fifo_lost = 0
 
     def _adv(self, n: int):
         self.p2word = (self.p2word + n) & 3

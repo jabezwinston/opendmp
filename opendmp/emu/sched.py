@@ -9,9 +9,11 @@ behave differently, both measured:
 * ICM-20948: a pending tick starts the next pass as soon as the previous one ends, so the rate
   is simply 1 / pass time [HW, probe49].
 
-A pass sees the latest sample written at or before its start; samples that arrive while a pass
-is running are overwritten by later ones and never seen.  On the MPU each sample write that lands
-inside a running pass also stalls it (`Chip.tick_stall_cycles`, measured 14-28 cycles by mix).
+A pass starts on the latest sample written at or before its start.  The hardware rewrites the
+sample page at every tick, even under a running pass, so a pass longer than the period reads
+newer samples part-way through [HW, InvensenseDMP Finding 47]; `run` hands those ticks to
+`Machine.run_pass`.  On the MPU each sample write that lands inside a running pass also stalls it
+(`Chip.tick_stall_cycles`, measured 14-28 cycles by mix).
 """
 from __future__ import annotations
 
@@ -23,19 +25,28 @@ from .machine import Machine, PassResult, Sample
 
 def run(machine: Machine, samples: Sequence[Sample], rate_hz: float,
         max_passes: int | None = None,
-        on_pass: Callable[[PassResult], None] | None = None) -> list[PassResult]:
-    """Run passes over `samples` (one per sample tick at `rate_hz`) until they run out."""
+        on_pass: Callable[[PassResult], None] | None = None,
+        midpass: bool = True) -> list[PassResult]:
+    """Run passes over `samples` (one per sample tick at `rate_hz`) until they run out.  With
+    `midpass` (the default) a pass longer than the period sees the samples that arrive while it
+    runs, as on silicon; without it, only its starting sample (stalls are then added after)."""
     if rate_hz <= 0:
         raise ValueError("rate must be positive")
     period = 1e9 / rate_hz
     policy = machine.chip.rate_policy
     results: list[PassResult] = []
     t, idx = 0.0, 0
+    cycle_ns = machine.chip.cycle_ns
+
+    def later(t0, i0):                              # the ticks after this pass's, in its cycles
+        for j in range(i0 + 1, len(samples)):
+            yield math.ceil((j * period - t0) / cycle_ns - 1e-9), samples[j]
+
     while idx < len(samples) and (max_passes is None or len(results) < max_passes):
-        res = machine.run_pass(samples[idx])
+        res = machine.run_pass(samples[idx], ticks=later(t, idx) if midpass else None)
         res.index, res.sample, res.start_ns = len(results), idx, t
         stall = machine.chip.tick_stall_cycles * machine.chip.cycle_ns
-        if stall:
+        if stall and not midpass:
             base, n = res.duration_ns, 0
             while True:                               # ticks inside the pass, stalls included
                 k = int(math.floor((t + base + n * stall) / period + 1e-9)) - idx
