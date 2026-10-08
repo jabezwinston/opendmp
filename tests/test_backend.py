@@ -386,3 +386,45 @@ def test_dmp3_int_product_is_two_instructions(tmp_path):
         a, b = s32(rnd.getrandbits(32)), s32(rnd.getrandbits(32))
         got = bd.emulate([Sample()], params={"n": a, "m": b}).packets[0]
         assert [int.from_bytes(got[i:i + 4], "big", signed=True) for i in (0, 4)] == [s32(a * b), s32(-a * b)]
+
+
+EQ_SRC = '''
+import opendmp as dmp
+
+@dmp.program(rate=50)
+def eqs(s):
+    a: dmp.param = 0.0
+    b: dmp.param = 0.0
+    n: dmp.param = 0
+    m: dmp.param = 0
+    e = 0
+    if a == b:
+        e = 1
+    if a != b:
+        e = e + 2
+    if n == m:
+        e = e + 4
+    dmp.emit(e=e)
+'''
+
+
+@pytest.mark.parametrize("chip", CHIPS)
+def test_equality_is_exact_at_minus_two(tmp_path, chip):
+    """== and != are RSUB then TEST for every pair (TEST reads the wrapped difference, Finding
+    45): exact at -2.0 and -2^31 too, and no XOR fallback."""
+    f = tmp_path / "eqs.py"
+    f.write_text(EQ_SRC)
+    p = runpy.run_path(str(f))["eqs"]
+    bd = p.build(chip)
+    assert "xor" not in bd.asm()
+    lsb = 2.0 ** -30
+    qs = [-2.0, -2.0 + lsb, -1.0, 0.0, lsb, 1.0, 2.0 - lsb]
+    ints = [-(1 << 31), -(1 << 31) + 1, -1, 0, 1, (1 << 31) - 1]
+    for a in qs:
+        for b in qs:
+            for n, m in ((ints[0], ints[0]), (ints[0], ints[1]), (0, 0), (ints[-1], ints[0])):
+                params = {"a": a, "b": b, "n": n, "m": m}
+                ref = p.simulate([Sample()], params=params)
+                e = int.from_bytes(ref.packets[0][:4], "big")
+                assert e == (a == b) + 2 * (a != b) + 4 * (n == m), params
+                assert bd.emulate([Sample()], params=params).packets == ref.packets, params

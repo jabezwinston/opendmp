@@ -100,7 +100,9 @@ class Cmp(Op):
 
 @dataclass(eq=False)
 class EqTest(Op):
-    """F := a == b: RSUB into a scratch word, then `test`."""
+    """F := a == b: RSUB into a scratch word, then `test`.  Exact for every pair: `test` reads R's
+    wrapped word, b + wrap(-a) mod 2^32, which is 0 exactly when a == b, -2.0 included
+    (InvensenseDMP Finding 45)."""
     a: Word
     b: Word
     scratch: Word
@@ -457,7 +459,7 @@ class Selector:
         a, b = self.operand(c.a), self.operand(c.b)
         op = c.op
         if op in ("eq", "ne"):
-            self.eq(c.a, c.b, a, b, when if op == "eq" else not when, label, c.loc)
+            self.eq(a, b, when if op == "eq" else not when, label, c.loc)
         elif op in ("lt", "ge"):
             self.lt(c.b, a, b, when if op == "lt" else not when, label, c.loc)
         else:                                      # gt / le: b < a
@@ -489,20 +491,12 @@ class Selector:
             self.emit(Cmp(x, y, self.get_scratch(), loc=loc))
             self.emit(BranchIf(label, False, loc=loc))
 
-    def eq(self, a_expr, b_expr, a: Word, b: Word, when: bool, label: str, loc=None):
-        """Branch to label when (a == b) == when: rsub with a subtrahend that cannot be -2.0,
-        or, when both can, the XOR of the two against zero."""
-        if not self.may_be_min(a_expr):
-            self.note(loc, "RSUB, then TEST (F := the difference is 0)")
-            self.emit(EqTest(a, b, self.get_scratch(), loc=loc))
-        elif not self.may_be_min(b_expr):
-            self.note(loc, "RSUB, then TEST (F := the difference is 0)")
-            self.emit(EqTest(b, a, self.get_scratch(), loc=loc))
-        else:
-            self.note(loc, "XOR, then RSUB against 0 and TEST: both sides can be exactly -2.0")
-            d = self.temp("xor")
-            self.emit(Alu("xor", d, a, b, loc=loc))          # 0 exactly when equal
-            self.emit(EqTest(d, self.const(0), self.get_scratch(), loc=loc))
+    def eq(self, a: Word, b: Word, when: bool, label: str, loc=None):
+        """Branch to label when (a == b) == when: RSUB, then TEST.  TEST reads the wrapped word
+        of the difference, so this is exact for every pair, -2.0 included (unlike a < b, which
+        reads F and needs a guard)."""
+        self.note(loc, "RSUB, then TEST (the difference's word is 0): exact for every pair")
+        self.emit(EqTest(a, b, self.get_scratch(), loc=loc))
         self.emit(BranchIf(label, when, loc=loc))
 
     # ------------------------------------------------------------------ values
