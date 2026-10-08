@@ -151,7 +151,7 @@ def test_insn_text_round_trip():
     for chip, text in (("mpu6050", "fmode 0\nmac 3,1,inc\nmacn.m 0,0\nfmode 7\nxor 1,2\nmovx 3,inc\n"
                                    "int.f4 65\nnop.f440\nclr.e5\nxchg02\nif f.alt\nend"),
                        ("icm20948", "fmode 1\ncmp.lt 2,17\nshl 5,adv\nsar 32\nload 3\nlo.next\nmovz\n"
-                                    "call 0x2000\nfmode 1\nret\nint\nint.fe")):
+                                    "call 0x2000\nfmode 1\nret\nint")):
         p = asm(text, chip)
         again = asm("\n".join(ln.insn.text() for ln in p.lines), chip)
         assert again.code() == p.code()

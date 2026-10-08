@@ -49,21 +49,21 @@ FIXED = {
           **{b: f"clr.{b:02x}" for b in range(0xD2, 0xD8)},        # [HW, probe68]
           **{b: f"clr.{b:02x}" for b in range(0xE0, 0xF0)}},       # [HW, probe69]
     ICM: {**_COMMON, 0xD2: "lo", 0xD3: "lo.next", 0xE0: "ret", 0xE2: "int", 0xE7: "clr.e7",
-          0xBF: "movz", 0xFE: "int.fe"},
+          0xBF: "movz"},                           # fe: no interrupt on DMP3 [HW, probe109]
 }
 FIXED_BYTE = {chip: {name: b for b, name in t.items()} for chip, t in FIXED.items()}
 
 # What each instruction does, for listings (ALU ops and operand forms are described in `effect`).
 DOC = {
-    "p2inc2": "P2 word += 2", "test": "F := (last result == 0)", "always": "predicate off",
+    "p2inc2": "P2 word += 2", "test": "F := (R's word == 0)", "always": "predicate off",
     "if f": "run while F (result < 0)", "if nf": "run while not F", "if f.alt": "as if f (db)",
     "store": "route -> RAM", "fifo": "route -> FIFO", "clr": "M[P2] := 0",
     "clr.next": "P2 word += 1; M[P2] := 0", "inc": "M[P2] += 1 lsb", "dec": "M[P2] -= 1 lsb",
     "inc.next": "P2 word += 1; M[P2] += 1", "dec.next": "P2 word += 1; M[P2] -= 1",
     "end": "end of pass", "p0blk": "P0 += 1 KB", "p1blk": "P1 += 1 KB", "p2blk": "P2 += 1 KB",
     "xchg01": "toggle: A and MOV via P1, B via P0", "xchg02": "toggle: A and MOV via P2, store to P0's page",
-    "int": "raise the interrupt", "int.fe": "raise the interrupt (fe, INFER on DMP3)",
-    "lo": "store the product's low word", "lo.next": "P2 word += 1; store the product's low word",
+    "int": "raise the interrupt",
+    "lo": "store R's low 30 bits", "lo.next": "P2 word += 1; store R's low 30 bits",
     "ret": "return", "movz": "toggle: MOV stores zero", "mode4": "enter mode 4",
     "nop.f4": "f4 with no operand: nothing", "nop.f440": "f4 40: nothing",
 }
@@ -338,8 +338,8 @@ _CHEAP = {"fmode", "always", "if f", "if nf", "if f.alt", "store", "fifo", "p2in
 _KEYS = {"mov": "mov", "movx": "movx", "clr": "clr", "clr.next": "clr", "lo": "lo", "lo.next": "lo",
          "load": "sload", "shl": "shift", "sar": "shift", "inc": "inc", "dec": "inc",
          "inc.next": "inc", "dec.next": "inc", "branch": "branch", "branch.m4": "branch1", "jump": "branch",
-         "jump.m4": "branch", "call": "call", "call.m4": "call", "ret": "ret", "int": "int",
-         "int.fe": "int", "int.f4": "int2", "end": "halt", "p0page": "page", "p1page": "page",
+         "jump.m4": "branch1", "call": "call", "call.m4": "call1", "ret": "ret", "int": "int",
+         "int.f4": "int2", "end": "halt", "p0page": "page", "p1page": "page",
          "p2page": "page", "clamp": "clamp", "cmp": "cmp", "and": "logic", "xor": "logic"}
 
 
@@ -351,8 +351,12 @@ def cost_key(insn: Insn, mode: int) -> str:
         return ("add" if op in ("add", "rsub") else "mul") + ("16" if mode in (2, 3) else "")
     if op in ("mac", "macn", "mac.m", "macn.m"):
         return "mac"
-    if op.startswith("clr."):
-        return "clr"
+    if op.startswith("clr.") and op != "clr.next":
+        return "clrx"                   # the clear aliases cost an ALU op [HW, probe111]
+    if op in ("clamp", "min", "cmp", "and", "xor") and mode in (6, 7):
+        return {"clamp": "clamp16", "min": "clamp16", "cmp": "cmp16"}.get(op, "logic16")
+    if op in ("inc", "dec", "inc.next", "dec.next") and mode in (2, 3, 6, 7):
+        return "inc16"
     if op.startswith("cmp."):
         return "fccmp"
     if op == ".db" and insn.args[:1] == (0xFD,):

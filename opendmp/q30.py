@@ -15,7 +15,7 @@ def s32(v: int) -> int:
 
 
 def sx30(v: int) -> int:
-    """Sign-extend a 30-bit field from bit 29 (the product's low word, manual 8.6)."""
+    """Sign-extend a 30-bit field from bit 29 (R's low word, `lo`: manual chapter 5)."""
     v &= LO30
     return v - ONE if v & (1 << 29) else v
 
@@ -37,10 +37,14 @@ def word_bytes(w: int) -> bytes:
 
 
 def parse_word(text: str) -> int:
-    """'40000000' or '0x40000000' -> raw word; '1.0q' or '-0.25q' -> Q30."""
+    """'40000000' or '0x40000000' -> raw word; '1.0q' or '-0.25q' -> Q30; '100i' or '-3i' -> a
+    decimal integer."""
     t = text.strip().lower()
     if t.endswith("q"):
         return to_q30(float(t[:-1])) & MASK
+    if t.endswith("i"):                         # 100i, -3i, 0x100i: an integer, decimal unless prefixed
+        body = t[:-1]
+        return int(body, 0 if body.lstrip("+-").startswith(("0x", "0b", "0o")) else 10) & MASK
     return int(t, 16) & MASK
 
 

@@ -19,9 +19,10 @@ from dataclasses import dataclass, field
 FALLBACK = {
     "page": "cheap", "skip": "cheap", "int": "cheap", "halt": "cheap", "int2": "cheap",
     "call": "branch", "ret": "cheap", "branch": "cheap", "branch1": "branch",
-    "movx": "mov", "clr": "mov", "sload": "mov", "lo": "clr",
+    "movx": "mov", "clr": "mov", "sload": "mov", "lo": "clr", "clrx": "clr", "call1": "branch1",
     "add16": "add", "mul16": "mul", "mac": "mul", "clamp": "add", "logic": "add", "cmp": "add",
     "inc": "add", "shift": "add", "fccmp": "add",
+    "clamp16": "clamp", "logic16": "logic", "cmp16": "cmp", "inc16": "inc",
 }
 
 
@@ -81,38 +82,58 @@ _MPU = {
     "skip": 5,      # 0.610 per byte (40 and c0 under a false d9; f4 00 skipped = 10)
     "branch": 15,   # 1.830: f4 00 and f4 01, taken; the bytes jumped over cost nothing
     "branch1": 10,  # 1.220: a one-byte branch in mode 4, taken (probe104; skipped: 5)
+    "int": 5,       # fe (probe111: intercept of two fe edges, 25 runs)
+    "int2": 10,     # f4 41-7f: two bytes, as f4 40 (10, probe111); its edge falls ~3 cycles in
     "clr": 12,      # 1.464: de, df
+    "cmp16": 13,    # f7 01 (probe111)
     "cmp": 17,      # 2.073: f5 01
-    "mov": 18, "movx": 18,   # 2.195: c0 c1 c8, to RAM or the FIFO
-    "add16": 22,    # 2.683: 40 under f2
-    "logic": 23,    # 2.805: f5 02
-    "inc": 23,      # 2.805: f8
+    "logic16": 17,  # f6 02 (probe111)
+    "mov": 18, "movx": 18,   # 2.195: c0 c1 c8 cf, to RAM or the FIFO
+    "inc16": 19,    # f8 under f3 (probe111)
+    "add16": 22,    # 2.683: 40 under f2 and f3
+    "clamp16": 22,  # f7 00 (probe111)
+    "logic": 23,    # 2.805: f5 02 03
+    "inc": 23,      # 2.805: f8 f9 fa fb
     "add": 28,      # 3.415: 40 41 44 (RAM or FIFO)
     "clamp": 28,    # 3.415: f5 00
-    "mul16": 52,    # 6.342: 42 under f3
+    "clrx": 28,     # d2-d7, e0-ef: the clear aliases cost an ALU op (probe111)
+    "mul16": 52,    # 6.342: 42 under f3, 42 under f2, 43 under f3
     "mul": 58,      # 7.073: 42 43
-    "mac": 60,      # 7.317: 00 under f0
+    "mac": 60,      # 7.317: 00 03 under f0
 }
 # ICM-20948: probe90 (no stall at any rate), 3000 fillers, spread 0-2 us.  us = cycles x 0.047675.
 _ICM = {
-    "cheap": 4,     # 0.1907: d8 8f f1
+    "cheap": 4,     # 0.1907: d8 8f f1 d0 d1 dc b0 a2 bc bf (probe90, probe111)
     "page": 4,
     "skip": 4,      # per byte: 40 skipped; a skipped f4 hi lo = 12
+    "int": 4,       # e2: within the timer's resolution of the cheap bytes (probe111)
+    # end -> the next pass with a tick pending: ~150 cycles from int + end + restart (probe111,
+    # +-5); start_cycles + halt model it as 134
     "branch": 13,   # jump f4 hi lo, taken (jump + f1 = 17)
-    "call": 13,     # call + ret = 18 (call S; f1 with S = d8 f1 e0: 30); the split is assumed
+    "branch1": 9,   # a bare two-byte jump target in mode 4 (probe111)
+    "call": 13,     # call S with S = jump back: 26 (probe111); call + ret = 18 (probe90)
+    "call1": 9,     # a bare two-byte call target in mode 4 (probe111)
     "ret": 5,
-    "clr": 11,      # 0.525: de
-    "lo": 11,       # 0.525: d2
-    "sload": 15,    # 0.716: d4
-    "shift": 15,    # 0.716: fd 3f
-    "mov": 17, "movx": 17,   # 0.811
-    "fccmp": 19,    # 0.907: fc c0 00
-    "add16": 20,    # 0.954: 40 under f3
-    "inc": 21,      # 1.002: f8
-    "mul": 25,      # 1.193: 42
-    "add": 26,      # 1.241: 40 41
+    "clr": 11,      # 0.525: de df
+    "lo": 11,       # 0.525: d2 d3
+    "sload": 15,    # 0.716: d4 d5
+    "shift": 15,    # 0.716: fd 3f, fd 7f
+    "cmp16": 12,    # f7 01 (probe111)
+    "cmp": 16,      # f5 01 (probe111)
+    "logic16": 16,  # f7 02 (probe111)
+    "inc16": 17,    # f8 under f3, f9 under f2 (probe111)
+    "mov": 17, "movx": 17,   # 0.811, to RAM or the FIFO (probe111)
+    "fccmp": 19,    # 0.907: fc c0 00, c0 01, c1 0b
+    "mul16": 19,    # 42 under f2 and f3 (probe111)
+    "add16": 20,    # 0.954: 40 under f3 and f2
+    "clamp16": 20,  # f6 00 (probe111)
+    "inc": 21,      # 1.002: f8 f9 fa fb
+    "logic": 22,    # f5 02 03 (probe111)
+    "mul": 25,      # 1.193: 42 43
+    "add": 26,      # 1.241: 40 41 44
     "clamp": 26,    # 1.241: f5 00
-    "mac": 27,      # 1.288: f0 00
+    "clrx": 26,     # e7: the clear alias costs an ALU op (probe111)
+    "mac": 27,      # 1.288: f0 00 03
 }
 
 MPU6050 = Chip(
@@ -121,7 +142,7 @@ MPU6050 = Chip(
     fifo_base=None,            # not in the 3 KB the host reaches; 0xc00-0xfff reads 0 (probe91)
     code_limit=0xC00,
     rate_policy="tick", clock_hz=8.199e6,
-    cycles=_MPU, source={k: "probe90" for k in _MPU},
+    cycles=_MPU, source={k: "probe90/111" for k in _MPU},
     start_cycles=110,          # 13.4 us: data-ready edge to the program's first byte (probe90)
     tick_stall_cycles=20,      # 14-28 by mix: d8 3.4 us, MOV 2.5, ADD 1.75 per tick (probe90)
 )
@@ -132,7 +153,7 @@ ICM20948 = Chip(
     fifo_base=0x3000,          # the FIFO is DMP RAM 0x3000-0x3fff, filled from 0x3000 (probe91)
     code_limit=0x3000,
     rate_policy="free", clock_hz=20.975e6,
-    cycles=_ICM, source={k: "probe90" for k in _ICM},
+    cycles=_ICM, source={k: "probe90/111" for k in _ICM},
     start_cycles=130,          # ~6.2 us (probe90)
     tick_stall_cycles=0,       # the same body at 9 kHz, 1 kHz and 100 Hz: 1145/1146/1146 us
 )

@@ -1,7 +1,7 @@
 """The DMP machine: state, one-instruction step, and one sample pass.
 
-Semantics follow the InvensenseDMP programmer's manual (docs/manual/, chapter 2 for the MPU-6050
-"mantis" core, chapter 8 for the ICM-20948 DMP3 core).  The emulator is strict in two ways:
+Semantics follow the InvensenseDMP programmer's manual (docs/manual/: chapter 5 defines every
+instruction for both the MPU-6050 and the ICM-20948 DMP3 core).  The emulator is strict in two ways:
 
 * `Unmodelled` is raised for any byte or state combination with no measured meaning (MPU `bf`,
   DMP3 `fc X Y` with X < 0xc0, both operand exchanges at once, ...).  It never guesses.
@@ -21,7 +21,6 @@ from .disasm import disasm
 
 
 UNKNOWN_F = object()      # F after an op whose flag rule is not measured
-UNKNOWN_LAST = object()   # what d1 would test after an op where that is not measured
 
 
 class Unmodelled(Exception):
@@ -34,7 +33,7 @@ class DmpFault(Exception):
 
 
 CARRY_ALL = ("pointers", "p2word", "route", "mode", "xchg", "predicate", "flags")
-CARRY_MEASURED = ("pointers", "p2word", "route", "mode", "predicate", "flags")
+CARRY_MEASURED = ("pointers", "p2word", "route", "mode", "predicate", "flags", "acc")
 
 
 @dataclass
@@ -125,18 +124,17 @@ class Machine:
         """The state after DMP_RST, as far as it is known (pointers and modes: INFER)."""
         self.p = [Ptr(), Ptr(), Ptr()]
         self.p2word = 0
-        self.route_ram = False    # FIFO is the at-rest route [HW, probe16]
+        self.route_ram = True     # RAM after DMP_RST [HW, probe113]
         self.mode = 1
         self.xchg01 = self.xchg02 = self.bf = False
         self.armed = False        # a d9/da/db predicate is in force
         self.skip = False         # ... and it evaluated false
         self.f = False            # the one flag: result < 0, or == 0 after d1 [HW, probe86 G/H]
-        self.last = 0             # what d1 tests
-        self.acc = 0              # MAC accumulator (Q60, or Q30 under mac_precision="q30")
+        self.acc = 0              # the result register R: the MAC accumulator and what d1 tests
+                                  # (64-bit Q60, or Q30 under mac_precision="q30") [HW, probe106/107]
         self.sh = [0, 0, 0, 0]    # DMP3 shifter register
         self.sh_sel = 0
         self.sh_loaded = False
-        self.prod_lo = 0          # DMP3: low 30 bits of the last product
         self.stack = [None] * 4   # DMP3 return stack, circular [HW, probe80]
         self.sp = 0
         self.fifo = bytearray()
@@ -189,20 +187,21 @@ class Machine:
         if sample is not None:
             self.write_sample(sample)
         carry = set(self.model.carry)
-        self.acc = 0                                        # [HW, probe74]
+        if "acc" not in carry:                              # R (and a MAC sum) survives the pass
+            self.acc = 0                                    # boundary on both parts [HW, probe113]
         if self.icm:
             for p in self.p:
                 p.block = 0                                 # [HW, probe47]
-            self.stack = [None] * 4                         # INFER
-            self.sp = 0
-        if "pointers" not in carry:
-            for p in self.p:
-                p.page = p.bank = 0
+            # the return stack and its pointer survive `end`: a pass that ends inside a call
+            # leaves its return addresses for later `ret`s [HW, probe109 D]
+        if "pointers" not in carry or self.icm:             # DMP3 starts every pass with all
+            for p in self.p:                                # three pointers at 0x0000, word 0
+                p.page = p.bank = 0                         # [HW, probe113]; the MPU keeps them
                 p.io = False
-        if "p2word" not in carry:
+        if "p2word" not in carry or self.icm:
             self.p2word = 0
         if "route" not in carry:
-            self.route_ram = False
+            self.route_ram = True
         if "mode" not in carry and not self.icm:            # DMP3 mode 4 survives [HW, probe54b]
             self.mode = 1
         if "xchg" not in carry:
@@ -211,10 +210,10 @@ class Machine:
             self.armed = self.skip = False
         if "flags" not in carry:
             self.f = False
-            self.last = 0
         self.pc = self.entry
         self.halted = False
-        self._fresh = True
+        if "acc" not in carry:
+            self._fresh = True
 
     def run_pass(self, sample: Sample | None = None) -> PassResult:
         self.begin_pass(sample)
@@ -334,20 +333,51 @@ class Machine:
 
     def _adv(self, n: int):
         self.p2word = (self.p2word + n) & 3
-        self._fresh = True                          # the destination moved (Model.mac_restart)
+        self._moved()
 
-    def _flags(self, f, last: int):
-        """F := f (None leaves it), and what d1 will test.  Both frozen under a predicate [HW].
+    def _mac_rule(self) -> str:
+        rule = self.model.mac_restart
+        if rule == "chip":
+            rule = "op" if self.icm else "move"
+        return rule
+
+    def _moved(self):
+        """The destination moved (a P2 page or bank load, d0, df, an op&4, an advancing MOV).  On
+        the MPU that restarts a MAC sum by zeroing R, so d1 then reads zero; DMP3 keeps R (only an
+        ALU op's own op&4 restarts its sum) [HW, probe86 B, probe88, probe107]."""
+        self._fresh = True
+        if self._mac_rule() == "move":
+            self.acc = 0
+
+    def _set_r(self, v: int):
+        """A result replaces R (what a later MAC adds to and d1 tests)."""
+        self.acc = (v << 30) if self.model.mac_precision == "q60" else v
+
+    def _r_lo(self) -> int:
+        """R's low 30 bits, sign-extended from bit 29 (DMP3 `lo`)."""
+        return sx30(self.acc & LO30) if self.model.mac_precision == "q60" else 0
+
+    def _load_shifter(self):
+        """DMP3: every op that writes R loads the shifter from it: word 0 = R's word, word 1 = its
+        low 30 bits [HW, probe64/110: CLAMP loads its compare D, INC its result, a MAC run its
+        sum; AND, XOR and the sign test load nothing]."""
+        if self.icm:
+            self.sh, self.sh_sel, self.sh_loaded = [self._r_word(), self._r_lo() & MASK, 0, 0], 0, True
+
+    def _r_word(self) -> int:
+        return ((self.acc >> 30) if self.model.mac_precision == "q60" else self.acc) & MASK
+
+    def _flags(self, f):
+        """F := f (None leaves it); frozen under a predicate [HW].
 
         F is the sign of the EXACT result, not of the wrapped word: 1.0 + 1.5 stores -1.5 and
         leaves F clear, so a compare never overflows [HW, probe86 E].  There is no Z flag on
-        either part: a zero result sets neither d9 nor da alone; d1 turns F into `last == 0`
+        either part: a zero result sets neither d9 nor da alone; d1 turns F into `R == 0`
         [HW, probe86 G/H; Finding 28's "d9 fires on 0" was the op's own zero emit]."""
         if self.armed:
             return
         if f is not None:
             self.f = f
-        self.last = last
 
     def _cond(self, b: int) -> bool:
         if self.f is UNKNOWN_F:
@@ -415,7 +445,7 @@ class Machine:
 
         # --- executed ---------------------------------------------------------------
         if icm and self.mode == 4 and b < 0x80:   # a branch target with no f4 of its own [HW]
-            return self._jump(b, m[pc + 1], pc + 2)
+            return self._jump(b, m[pc + 1], pc + 2) + "1"     # 9 cycles, bare [HW, probe111]
         if not icm and self.mode == 4 and b < 0x80:
             # the MPU's mode 4: a byte below 0x40 is a one-byte branch, the f4's signed 6-bit
             # displacement with the f4 implied: to pc + 1 + d, 10 cycles taken (ISA2 Finding 42,
@@ -436,12 +466,14 @@ class Machine:
             P.io = icm and self.mode == 4          # I/O space [HW, probe82]
             if i == 2:
                 self.p2word = 0                     # [HW, probe61/69]
-                self._fresh = True
+                self._moved()
             return "page"
         if hi == 0xB:
             sel, v = (b >> 2) & 3, b & 3
             if sel < 3:
                 self.p[sel].bank = v
+                if sel == 2:
+                    self._moved()                   # a P2 bank load too [HW, probe107]
             elif v < 3:
                 P = self.p[v]
                 P.block = (P.block + 1) % self.chip.block_mod   # [HW, probe47/84]
@@ -455,22 +487,26 @@ class Machine:
         if b == 0xD0:
             self._adv(2)
             return "cheap"
-        if b == 0xD1:                               # TEST: F := (last == 0)
-            if self.last is UNKNOWN_LAST:
-                raise Unmodelled("d1 after CLAMP: what it tests is not measured (probe103)")
-            self.f = self.last == 0
+        if b == 0xD1:                               # TEST: F := (R's word == 0), at the lane
+            w = self._r_word()                      # width in force when d1 runs [HW, probe107]
+            if self.mode in (3, 7):
+                w &= 0xFFFF
+            elif self.mode in (2, 6):
+                w &= 0xFFFF0000
+            self.f = w == 0
             return "cheap"
         if 0xD2 <= b <= 0xD7:
             if not icm:
-                return "clr" + self._store(0)       # a clear on the MPU [HW, probe68]
-            if b <= 0xD3:                           # low word of the last product [HW, probe51]
-                if b == 0xD3:
+                return "clrx" + self._store(0)      # a clear on the MPU [HW, probe68]
+            if b <= 0xD3:                           # R's low 30 bits: a product's, a MAC sum's
+                if b == 0xD3:                       # [HW, probe51, probe110]
                     self._adv(1)
-                return "lo" + self._store(self.prod_lo)
+                return "lo" + self._store(self._r_lo())
             src = self._srcs()[2]
             self.sh = [self._read(src, k) & MASK for k in range(4)]
             self.sh_sel, self.sh_loaded = b - 0xD4, True
-            return "sload"
+            self._set_r(s32(self.sh[self.sh_sel]))  # R := the selected word, F untouched [HW word 0,
+            return "sload"                          # probe107]
         if b == 0xDC:
             self.route_ram = True
             return "cheap"
@@ -484,14 +520,14 @@ class Machine:
             return "clr" + self._store(0)
         if hi == 0xE:
             if not icm:
-                return "clr" + self._store(0)       # e0-ef clear on the MPU [HW, probe69]
+                return "clrx" + self._store(0)      # e0-ef clear on the MPU [HW, probe69]
             if b == 0xE0:
                 return self._ret()
             if b == 0xE2:
                 self.ints += 1                      # DMP_INT1 [HW, probe53]
                 return "int"
             if b == 0xE7:
-                return "clr" + self._store(0)
+                return "clrx" + self._store(0)
             raise Unmodelled(f"{b:02x} on DMP3 has no measured meaning")
         if b == 0xF4:                               # the MPU branch family [HW, probe26/27/69/70]
             imm = m[pc + 1]
@@ -520,7 +556,9 @@ class Machine:
                 return "cheap"
             return self._shift(m[pc + 1])
         if b == 0xFE:
-            self.ints += 1                          # [HW, probe69/70]; DMP3: INFER
+            if icm:
+                raise Unmodelled("fe on DMP3 raises no interrupt (probe109); its effect is unmeasured")
+            self.ints += 1                          # [HW, probe69/70]
             return "int"
         if b == 0xFF:
             self.halted = True
@@ -549,22 +587,21 @@ class Machine:
         a, b = self._read(pa, A), self._read(pb, B)
         mode, k = self.mode, op & 3
         q60 = self.model.mac_precision == "q60"
-        lo = 0
         store = True
+        racc = None
         if mode == 0:                               # multiply-accumulate [HW, probe74/86]
             prod = -(a * b) if op & 1 else a * b
-            rule = self.model.mac_restart
-            if rule == "chip":
-                rule = "op" if self.icm else "move"
+            rule = self._mac_rule()
             if (rule == "move" and self._fresh) or (rule == "op" and op & 4):
                 self.acc = 0
-            if q60:
-                self.acc += prod
+            if q60:                                 # a 64-bit register: Q60 in [-8, 8), wrapping;
+                acc = (self.acc + prod) & ((1 << 64) - 1)   # F is its sign bit [HW, probe106]
+                self.acc = acc - (1 << 64) if acc >> 63 else acc
                 r = self.acc >> 30
             else:
                 self.acc += prod >> 30
                 r = self.acc
-            self._flags(r < 0, r)
+            self._flags(r < 0)
             key = "mac"
         elif mode in (5, 6, 7):                     # CLAMP / CMP / AND / XOR [HW, probe70/86]
             a, b, w = self._lanes(a, b)
@@ -573,20 +610,24 @@ class Machine:
                 r = x - (1 << w) if x >= 1 << (w - 1) else x
                 if r < -(1 << (w - 1)):
                     r += 1 << w
-                # F := A was clamped (the exact result differs from A); what d1 then reads is
-                # unmeasured beyond one cell [HW, probe103: 1920 cells per part, lanes included]
-                self._flags(x != a, UNKNOWN_LAST)
+                # A compare inside: D = B - A when A >= 0, A + B when A < 0.  F := D < 0, i.e. A
+                # was clamped [HW, probe103: 1920 cells per part, lanes included]; R := D, so d1
+                # then tests whether A sat on its bound [HW, probe107]
+                d = b - a if a >= 0 else a + b
+                self._flags(d < 0)
+                racc = d
                 key = "logic"
             elif k == 1:                            # "CMP": a sign test, not a compare, both
                 r, store = a - b, False             # cores: F := a < 0 and b >= 0 (probe98/99,
-                self._flags(a < 0 <= b, 0)          # 56 cells); no store; d1 then reads zero
+                self._flags(a < 0 <= b)             # 56 cells); no store; R untouched (probe107)
                 key = "cmp"
-            else:                                   # AND / XOR: F untouched, d1 reads zero
+            else:                                   # AND / XOR: F and R untouched [HW, probe107]
                 r = (a & b) if k == 2 else (a ^ b)
-                self._flags(None, 0)
                 key = "logic"
             if k == 0:
                 key = "clamp"
+            if mode in (6, 7):
+                key += "16"                         # half-word lanes run faster [HW, probe111]
         else:
             a, b, _ = self._lanes(a, b)
             if k == 0:
@@ -599,16 +640,19 @@ class Machine:
                 r, key = b + neg, "add"
             else:
                 prod = a * b if k == 2 else -(a * b)
-                r, lo, key = prod >> 30, prod & LO30, "mul"
+                r, key = prod >> 30, "mul"
             if mode in (2, 3):
                 key += "16"                         # half-word lanes run faster [HW, probe87]
-            self._flags(r < 0, r)
-        if mode != 0:
-            self.acc = (r << 30) if q60 else r      # a non-MAC op replaces the accumulator
+            self._flags(r < 0)
+            racc = r
+        if mode != 0 and racc is not None:
+            if key.startswith("mul") and q60:
+                self.acc = prod                     # R keeps the whole product [HW, probe110]
+            else:
+                self._set_r(racc)                   # the op's exact result replaces R
         self._fresh = False
-        if self.icm:                                # every ALU op loads the shifter [HW, probe64]
-            self.sh, self.sh_sel, self.sh_loaded = [r & MASK, sx30(lo) & MASK, 0, 0], 0, True
-            self.prod_lo = sx30(lo)
+        if mode == 0 or racc is not None:
+            self._load_shifter()
         if store:
             key += self._store(r)
         elif self.tracer:
@@ -633,7 +677,9 @@ class Machine:
             self._adv(1)
         d = -1 if b & 1 else 1
         m = self.mode
-        if self.route_ram:
+        if self.route_ram or not self.icm:
+            # the operand is M[P2]; under FIFO routing the MPU emits the result as a new item of
+            # the lane's width and leaves RAM alone [HW, probe112]
             pi, word = self._dest()
             P = self.p[pi]
             a = P.addr() + 4 * word
@@ -642,7 +688,10 @@ class Machine:
                 self._range(a, "inc/dec")
                 old = s32(int.from_bytes(self.mem[a:a + 4], "big"))
         else:
-            # under FIFO routing INC/DEC modify the last emitted word [HW DMP3, probe52; MPU INFER]
+            # DMP3 under FIFO routing changes the last emitted word [HW, probe52/112]; under a
+            # lane mode the result is irregular (0000ffff + 1 under f3 gave ffff0001, probe112)
+            if m in (2, 3, 6, 7):
+                raise Unmodelled("DMP3 INC/DEC on the FIFO under a lane mode is irregular (probe112)")
             if len(self.fifo) < 4:
                 raise Unmodelled("INC/DEC under FIFO routing with no word in the FIFO")
             old = s32(int.from_bytes(self.fifo[-4:], "big"))
@@ -663,10 +712,14 @@ class Machine:
                 self.mem[a:a + 4] = new.to_bytes(4, "big")
                 if self.tracer:
                     self._note = f"M[{a:#05x}] := {new:08x}"
+        elif not self.icm:
+            self._store(new)                        # a new FIFO item, the lane's width
         else:
             self._fifo_put(new.to_bytes(4, "big"), at=self._fifo_wr - 4)
-        self._flags(r < 0, r)
-        return "inc"
+        self._flags(r < 0)
+        self._set_r(r)                              # R := the exact result [HW, probe107]
+        self._load_shifter()                        # [HW, probe110]
+        return "inc16" if m in (2, 3, 6, 7) else "inc"
 
     def _jump(self, hi: int, lo: int, ret: int) -> str:
         t = ((hi << 8) | lo) & 0x3FFF
@@ -682,7 +735,7 @@ class Machine:
         self.sp = (self.sp - 1) & 3
         r = self.stack[self.sp]
         if r is None:
-            raise DmpFault("e0 with no return address: the DMP stops after this pass (manual 8.3)")
+            raise DmpFault("e0 with no return address: the DMP stops after this pass (manual: RET)")
         self.pc = r
         return "ret"
 
@@ -694,7 +747,6 @@ class Machine:
         w = self._read(1, x & 3) & 0x3F
         t, c = y >> 2, y & 3
         self.f = (w == t, w > t, w < t, w != t)[c]  # [HW, probe83b]; updates F even when armed
-        self.last = 0                               # "leaves no ALU result"
         return "fccmp"
 
     def _shift(self, n: int) -> str:
@@ -713,4 +765,5 @@ class Machine:
                        for i in range(4)]
             self.sh = new
             val = s32(new[self.sh_sel])
+        self._set_r(val)                            # R := the shifted word, F untouched [HW, probe107]
         return "shift" + self._store(val)

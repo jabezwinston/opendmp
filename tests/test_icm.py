@@ -135,3 +135,42 @@ def test_probe91_fifo_is_ram_at_0x3000():
     r2 = m.run_pass(Sample(ax=7))
     assert bytes(m.mem[0x3000:0x3000 + 48]) == r1.fifo + r2.fifo
     assert m.chip.code_limit == 0x3000
+
+
+def test_probe110_mul_then_shl30_is_the_integer_product():
+    """DMP3: after a MUL the shifter holds R = the whole product; `shl 30` stores it mod 2^32;
+    after a MAC run it holds the sum, and `lo` its low 30 bits (silicon, probe110)."""
+    from opendmp.isa import assemble
+    from opendmp.emu import Machine, Sample
+    for a, b in [(3, 5), (-26960, 23810), (46341, 46341), (-(1 << 31), 3), (123456789, -987)]:
+        src = (".chip icm20948\n.entry 0x1000\n.org 0x1000\nfmode 1\nalways\nfifo\np0bank 1\np0page 0\n"
+               "p1bank 1\np1page 1\nmul 0,0\nshl 30\nfmode 0\nmac 0,0,inc\nmac 0,0\nlo\nend\n")
+        m = Machine("icm20948")
+        for addr, d in assemble(src, "icm20948").segments():
+            m.load(d, addr)
+        m.poke_words(0x100, [a & 0xFFFFFFFF])
+        m.poke_words(0x110, [b & 0xFFFFFFFF])
+        w = [int.from_bytes(m.run_pass(Sample()).fifo[i:i + 4], "big") for i in range(0, 20, 4)]
+        assert w[1] == (a * b) & 0xFFFFFFFF
+        lo = (2 * a * b) & ((1 << 30) - 1)
+        assert w[4] == (lo - (1 << 30) if lo >> 29 else lo) & 0xFFFFFFFF
+
+
+def test_probe109_return_stack_survives_end():
+    """A pass that ends two calls deep leaves its return addresses: the next pass's ret returns
+    into the inner caller, the one after into main (silicon, probe109 D)."""
+    from opendmp.isa import assemble
+    from opendmp.emu import Machine, Sample
+    src = (".chip icm20948\n.entry 0x1000\n.org 0x1000\n"
+           "fmode 1\nalways\nstore\np1bank 2\np1page 4\ncmp.eq 0,0\nif nf\nret\nalways\nfmode 1\n"
+           "p2bank 2\np2page 4\ninc\ncall sub1\nfmode 1\np2bank 2\np2page 6\ninc\nint\nend\n"
+           "sub1:\nfmode 1\ncall sub2\nfmode 1\np2bank 2\np2page 5\ninc\nint\nend\n"
+           "sub2:\nfmode 1\nint\nend\n")
+    m = Machine("icm20948")
+    for addr, d in assemble(src, "icm20948").segments():
+        m.load(d, addr)
+    m.run_pass(Sample())
+    m.run_pass(Sample())
+    assert (m.peek_word(0x250), m.peek_word(0x260)) == (1, 0)
+    m.run_pass(Sample())
+    assert (m.peek_word(0x250), m.peek_word(0x260)) == (1, 1)

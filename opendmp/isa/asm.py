@@ -6,7 +6,8 @@ The syntax is one instruction per line, as `Insn.text()` prints it, plus:
     .entry 0x400             where PRGM_START points (default: the chip's)
     .org 0x100               continue at this address
     label:                   a label, alone or before an instruction
-    .dw 0.25q, -1.0q, 0x7fffffff    32-bit big-endian words (Q30 with a q suffix)
+    .dw 0.25q, -1.0q, 100i, 7fff    32-bit big-endian words: Q30 with a q suffix, a decimal
+                             integer with i, else hex
     .db 0x12, 0x34           raw bytes
     .mode 1                  assert that the mode register holds 1 here (emits nothing)
     ; comment

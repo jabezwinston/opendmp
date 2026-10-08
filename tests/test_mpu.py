@@ -186,6 +186,23 @@ def test_probe100_rsub_cannot_subtract_minus_two(chip):
         assert flag_after(chip, 0x01, 0xF1, [a, 0, 0, 0], [b, 0, 0, 0]) == f, (a, b)
 
 
+@pytest.mark.parametrize("chip", ["mpu6050", "icm20948"])
+@pytest.mark.parametrize("op,want", [
+    (0x00, [0x90000000, 0x20000000, 0xB0000000, 0x40000000, 0x0F0F0F0F]),    # mac: +9.0, F set
+    (0x01, [0x70000000, 0xE0000000, 0x50000000, 0xC0000000, 0x0E0E0E0E]),    # macn: -9.0, F clear
+])
+def test_probe106_mac_register_is_64_bit(chip, op, want):
+    """Four MACs of 1.5 * 1.5: the stored words wrap mod 2^32, and F is the sign of a 64-bit
+    accumulator (Q60 in [-8, 8)), so +9.0 sets it and -9.0 clears it (silicon, both parts)."""
+    icm = chip == "icm20948"
+    code = [0xF0, 0xD8, 0xDD, 0xB1, 0x80, 0xB5, 0x91] + [op] * 4
+    code += [0xF1, 0xB3, 0x8F, 0xD9, 0xC0, 0xDA, 0xC2, 0xD8]
+    m, r = run1(code, chip=chip, entry=0x1000 if icm else 0x400,
+                setup=lambda m: (m.poke_words(0x100, [0x60000000]), m.poke_words(0x110, [0x60000000]),
+                                 m.poke_words(0x3F0, [0x0F0F0F0F, 0x0E0E0E0E])))
+    assert [w & 0xFFFFFFFF for w in words(r.fifo)] == want
+
+
 # (A, B, the value silicon stored, F): cells from probe103, identical on both parts (Finding 41)
 CLAMP_CELLS = [
     (0x80000001, 0xC0000000, 0x40000000, True),     # A < 0: max(A, -B) = -B
@@ -261,3 +278,68 @@ def test_probe104_mode4_one_byte_branch():
     assert m.peek_word(0x100) == 4
     m, r = run1(head + zero + [0xF4, 0x00, 0xDA, 0x02, 0xD8] + [0xF8] * 4 + [0xD8, 0xFE])
     assert m.peek_word(0x100) == 3                          # taken: over d8 and one of the incs
+
+
+def _r_cell(chip, x, y, body, tail):
+    """probe107's cell: P0 -> [x, 0.5, 0, 0] at 0x100, P1 -> [y, 0.5, 0, 0] at 0x110, P2 -> 0x120,
+    R := 1.0 (add 1,1), then body, then tail."""
+    from opendmp.isa import assemble
+    icm = chip == "icm20948"
+    e = 0x1000 if icm else 0x400
+    src = (f".chip {chip}\n.entry {e:#x}\n.org {e:#x}\nfmode 1\nalways\nstore\np0bank 1\np0page 0\n"
+           f"p1bank 1\np1page 1\np2bank 1\np2page 2\nadd 1,1\n{body}{tail}")
+    code = assemble(src, chip).code()
+    return run1(code[:-1] if code.endswith(b"\xff") else code, chip=chip, entry=e,
+                setup=lambda m: (m.poke_words(0x100, [x & 0xFFFFFFFF, 0x20000000, 0, 0]),
+                                 m.poke_words(0x110, [y & 0xFFFFFFFF, 0x20000000, 0, 0])))[0]
+
+
+@pytest.mark.parametrize("chip", ["mpu6050", "icm20948"])
+def test_probe107_test_reads_the_result_register(chip):
+    """d1 tests R's word (wrapped) at the lane width in force; CLAMP leaves its compare in R;
+    AND/XOR/MOV leave R; on the MPU a P2 move zeroes R, on DMP3 it does not (silicon, both)."""
+    def f(x, y, body):
+        return _r_cell(chip, x, y, body, "test\nend\n").f
+    assert f(-1 << 31, -1 << 31, "add 0,0\n")                 # -2 + -2 wraps to 0: F set
+    assert f(-1 << 31, -1 << 31, "mul 0,0\n")
+    assert f(0x8000, 0x8000, "fmode 3\nadd 0,0\n")            # the low lane wraps to 0
+    assert not f(0x8000, 0x8000, "fmode 3\nadd 0,0\nfmode 1\n")   # ... the word does not
+    assert not f(0, 0, "fmode 5\nand 0,0\n")                  # AND leaves R = 1.0
+    assert f(5, 5, "fmode 5\nclamp 0,0\n") and not f(-5, -5, "fmode 5\nclamp 0,0\n")
+    assert f(3, 3, "p2page 2\n") == (chip == "mpu6050")
+    assert f(3, 3, "p2bank 1\n") == (chip == "mpu6050")
+    assert not f(3, 3, "p0page 5\n")
+
+
+@pytest.mark.parametrize("chip", ["mpu6050", "icm20948"])
+@pytest.mark.parametrize("x,y,body,want", [
+    (5, 7, "fmode 5\nclamp 0,0\n", 2), (-5, 7, "fmode 5\nclamp 0,0\n", 2),
+    (9, 7, "fmode 5\nclamp 0,0\n", -2), (5, 6, "fmode 5\nxor 0,0\n", 0x40000000),
+    (3, 3, "fmode 1\ninc\n", 0x40000001), (3, 3, "fmode 1\nmov 0\n", 0x40000000),
+])
+def test_probe107_mac_continues_from_r(chip, x, y, body, want):
+    m = _r_cell(chip, x, y, body, "fmode 0\nmac 2,2\nend\n")
+    assert m.peek_word(0x120) == want
+
+
+@pytest.mark.parametrize("chip", ["mpu6050", "icm20948"])
+def test_probe113_pass_carry(chip):
+    """R carries from pass to pass (a lone MAC run accumulates across passes); the route after
+    DMP_RST is RAM; DMP3 starts every pass with its pointers at 0, the MPU keeps them (silicon)."""
+    from opendmp.isa import assemble
+    e = 0x1000 if chip == "icm20948" else 0x400
+    src = (f".chip {chip}\n.entry {e:#x}\n.org {e:#x}\nfmode 0\nalways\nfifo\np0bank 1\np0page 0\n"
+           "p1bank 1\np1page 1\nmac 0,0\nend\n")
+    m = Machine(chip)
+    for a, d in assemble(src, chip).segments():
+        m.load(d, a)
+    m.poke_words(0x100, [0x20000000])
+    m.poke_words(0x110, [0x20000000])
+    got = [words(m.run_pass(Sample()).fifo)[0] for _ in range(4)]
+    assert got == [0x10000000, 0x20000000, 0x30000000, 0x40000000]
+    m = Machine(chip)
+    assert m.route_ram
+    m.load(bytes([0xF1, 0xD8, 0xB2, 0x85, 0xFF]), e)    # P0 := 0x250, end
+    m.run_pass(Sample())
+    m.begin_pass(Sample())
+    assert m.p[0].addr() == (0 if chip == "icm20948" else 0x250)

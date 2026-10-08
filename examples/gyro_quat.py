@@ -4,7 +4,7 @@ pass without a square root.
     q <- q + q (x) (0, h)            h = w * dt / 2: first-order integration
     q <- q * (1.5 - |q|^2 / 2)       one Newton step towards |q| = 1
 
-The Newton step is the vendor firmware's own (manual section 4.9).  It needs no divide and no
+The Newton step is the one in the manual's §9.10.  It needs no divide and no
 square root, and one step a pass is enough because |q| never strays far from 1.  Each
 component of the product is a four-term dot product: one multiply-accumulate run on the MPU.
 The result drifts with the gyro bias; mahony.py adds the accelerometer correction.
