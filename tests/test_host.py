@@ -62,3 +62,27 @@ def test_run_actions_and_changes_are_validated_first():
     rig = rig_for("pid_level")
     with pytest.raises(ValueError, match="declared range"):
         rig.run(1.0, changes=[(0.5, "setpoint", 0.9)])       # refused before anything starts
+
+
+class RecordingBridge:
+    """Records register writes (and ICM bank selects) as (bank, reg, value)."""
+    def __init__(self):
+        self.log, self._bank = [], 0
+
+    def bank(self, n):
+        self._bank = n
+
+    def wr(self, reg, data):
+        self.log.append((self._bank, reg, data))
+
+
+@pytest.mark.parametrize("chip,want", [
+    ("mpu6050", [(0, 0x6A, 0x48), (0, 0x6A, 0x40)]),
+    ("icm20948", [(0, 0x03, 0x48), (0, 0x03, 0x40)]),
+])
+def test_stop_halts_with_dmp_reset(chip, want):
+    """Clearing DMP_EN does not stop a running pass; DMP_RST does (InvensenseDMP Finding 47)."""
+    rig = Rig.__new__(Rig)
+    rig.b, rig.chip = RecordingBridge(), chip
+    rig.stop()
+    assert rig.b.log == want

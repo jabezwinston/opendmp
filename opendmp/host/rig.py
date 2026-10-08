@@ -155,10 +155,14 @@ class Rig:
             self.reg(0, 0x03, 0xC0)                     # DMP_EN | FIFO_EN
 
     def stop(self):
+        """Halt the DMP.  DMP_RST stops a pass that is running (clearing DMP_EN alone lets it run to
+        its end, or forever: InvensenseDMP Finding 47); FIFO_EN stays set so the FIFO stays readable."""
         if self.chip == "mpu6050":
+            self.b.wr(0x6A, 0x48)                       # FIFO_EN | DMP_RESET
             self.b.wr(0x6A, 0x40)
         else:
-            self.reg(0, 0x03, 0x40)                     # keep FIFO_EN: the FIFO stays readable
+            self.reg(0, 0x03, 0x48)                     # FIFO_EN | DMP_RST
+            self.reg(0, 0x03, 0x40)
 
     def run(self, seconds: float, watch=(), period: float = 0.25, changes=()):
         """Run the loaded program, reading the FIFO as it fills; (packets, interrupt count).
