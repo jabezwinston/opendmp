@@ -7,7 +7,7 @@ the vendor images.
 Two things make the ISA stateful, and the decoder tracks both:
 
 - **The mode register** (`f0`-`f7`, sticky).  It names the ALU byte: under f1/f2/f3 op 0-3 is
-  add/rsub/mul/nmul, under f5/f6/f7 it is min/cmp/and/xor, and under f0 it is mac/macn
+  add/rsub/mul/nmul, under f5/f6/f7 it is clamp/cmp/and/xor, and under f0 it is mac/macn
   [HW, probe70/74, Finding 30].
 - **DMP3 mode 4**, entered by any `f4`.  While it is set, a byte below 0x80 is not an ALU op
   but a two-byte jump or call target, until a width byte ends the mode [HW, probe54b/64].
@@ -32,7 +32,7 @@ def chip_name(chip) -> str:
 
 ARITH = ("add", "rsub", "mul", "nmul")                  # f1 f2 f3
 LOGIC = ("clamp", "cmp", "and", "xor")                  # f5 f6 f7   [HW, probe70/86/103]
-MACS = ("mac", "macn", "mac.m", "macn.m")               # f0: acc +/- A*B; op2/3 = op0/1 [HW, F30]
+MACS = ("mac", "macn", "mac.m", "macn.m")               # f0: R +/- A*B; op2/3 = op0/1 [HW, F30]
 FAMILY = {0: MACS, 1: ARITH, 2: ARITH, 3: ARITH, 5: LOGIC, 6: LOGIC, 7: LOGIC}
 ALU_OPS = {name: (fam, i) for fam, names in (("mac", MACS), ("arith", ARITH), ("logic", LOGIC))
            for i, name in enumerate(names)}
@@ -64,7 +64,7 @@ DOC = {
     "xchg01": "toggle: A and MOV via P1, B via P0", "xchg02": "toggle: A and MOV via P2, store to P0's page",
     "int": "raise the interrupt",
     "lo": "store R's low 30 bits", "lo.next": "P2 word += 1; store R's low 30 bits",
-    "ret": "return", "movz": "toggle: MOV stores zero", "mode4": "enter mode 4",
+    "ret": "return", "movz": "toggle: MOV stores a FIFO-dependent value (do not use)", "mode4": "enter mode 4",
     "nop.f4": "f4 with no operand: nothing", "nop.f440": "f4 40: nothing",
 }
 

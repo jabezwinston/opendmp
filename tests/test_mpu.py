@@ -47,7 +47,7 @@ def test_probe74_mac():
     # the dot product of A = 0.5 with B = [1, 1/2, 1/4, 1/8]
     assert cell74([0xF0, 0x00, 0x08, 0x10, 0x18], B=(0x40000000, 0x20000000, 0x10000000, 0x08000000)) \
         == [0x20000000, 0x30000000, 0x38000000, 0x3C000000]
-    # reset at the start of every pass
+    # R carries across passes, but each pass's P2 page load zeroes it, so every pass sums afresh
     assert cell74([0xF0, 0x00, 0x00], passes=3) == [[0x10000000, 0x20000000]] * 3
 
 

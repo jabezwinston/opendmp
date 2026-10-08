@@ -60,7 +60,9 @@ the same thing: ADD, RSUB, INC, compares, CLAMP, AND/XOR and moves give identica
 way, and so does scaling by a whole number (`7 * x` is a sum of copies). The multiply is the
 exception. The DMP's MUL and MAC keep the top of the 64-bit product, (a·b) >> 30, which is the
 Q30 product, and they throw an integer product away (3 × 5 → 0). So `a * b` needs the type to
-mean one thing: on Q30 values it is one MUL, and on two Ints it is `dmp.imul`, built from adds.
+mean one thing: on Q30 values it is one MUL, and on two Ints it is the integer product: on the
+ICM a MUL then the shifter's SHL 30, which recovers the product's low word; on the MPU
+`dmp.imul`, built from adds.
 The type also fixes what a literal is: `3` is an Int, while `3.0` does not fit in Q30.
 
 **Reinterpreting a word.** `dmp.raw(x)` reads a Q30 value's word as an Int, and `dmp.q30(n)` reads
@@ -118,12 +120,14 @@ h: dmp.state = [0.0] * 4           # lists, nested lists: one word per element
 | construct | notes |
 |---|---|
 | `a + b`, `a - b`, `-a` | see the exact-sum rule below |
-| `a * b` | Q30 × Q30: floored. Int × Int: the exact product modulo 2³², compiled to `dmp.imul(n, m)` (shift-and-add, 32 steps; up to about 1.0 ms on the MPU, 0.34 ms on the ICM). A constant integer factor scales either type exactly, by doublings |
+| `a * b` | Q30 × Q30: floored. Int × Int: the exact product modulo 2³²: on the ICM two instructions (MUL, then SHL 30); on the MPU `dmp.imul(n, m)` (shift-and-add, 32 steps; up to about 1.0 ms). A constant integer factor scales either type exactly, by doublings |
 | `dmp.raw(x)`, `dmp.q30(n)` | the same word read as an Int or as Q30: no instruction (above) |
 | `x / y` | Q30 values: truncated toward zero, exact to the last bit, saturating at ±(2 − 2⁻³⁰) when the quotient reaches 2 or y is 0. It compiles to `dmp.div(x, y)` (below), which is also callable by that name |
 | `x / C`, `x * (1 / C)` | C a constant: a multiply by the reciprocal, rounded to Q30 (one MUL, not exact division) |
 | `n // m` | Int values: floor division exactly as Python's, for every 32-bit pair. `n // 0` and the one overflow, −2³¹ // −1, saturate at the Int limits. It compiles to `dmp.idiv(n, m)` (32 steps; about 2.7 ms on the MPU, 0.9 ms on the ICM) |
-| `x * 2**k`, `x << k` on Bits | doublings; `>>` on Bits |
+| `x * 2**k` | doublings |
+| `x << k` on Bits, k 0–31 | the word shifted left, in place: doublings (on the MPU a lane move does the first 16; on the ICM one MUL and SHL 30 for k ≥ 2) |
+| `x >> k` on Bits, k 0–31 | arithmetic shift right: a MUL by 2⁻ᵏ (k = 31: two MULs) |
 | `abs(x)` | `abs(-2.0)` wraps to −2.0 |
 | `min(a, b)`, `max(a, b)` | exact |
 | `dmp.clamp(x, lo, hi)` | lo and hi constants; exact |
@@ -288,7 +292,7 @@ restoring division ...; costs up to 10441 cycles = 1273 us each` on the MPU), no
 | `n += 1` on an Int | one INC |
 | a sum with no products (`a + b - c`, `r + r - b`) | a chain of ADD/RSUB: the same value modulo 2³² |
 | constant integer coefficients (`n * 100`, `7 * a - 3 * k`) | doublings, by Horner's rule on the coefficients' binary or signed digits (`n * 100`, 100 = 64 + 32 + 4: 8 ops, not a 100-term run); with products in the sum, the scaled plain part enters the multiply-accumulate run as one term |
-| `x / y` (`dmp.div`), `n // m` (`dmp.idiv`), `n * m` on Ints (`dmp.imul`) | the library routines (above) |
+| `x / y` (`dmp.div`), `n // m` (`dmp.idiv`), `n * m` on Ints (`dmp.imul` on the MPU) | the library routines (above) |
 | `dmp.raw(x)`, `dmp.q30(n)` | nothing: the same word |
 
 **The pass-time bound.** A build computes an upper bound on a pass

@@ -6,11 +6,11 @@ produces an annotated listing, a cycle-accurate emulator run and a host runtime 
 program onto the bench rigs and decodes its FIFO packets by name.
 
 The ISA knowledge comes from `~/Git_repos/InvensenseDMP`: the programmer's manual in
-`docs/manual/`, the evidence log in `ISA2.md` (Findings 37 and 38 were measured for this
+`docs/manual/`, the evidence log in `ISA2.md` (Findings 37–54 were measured for this
 project) and the bench in `bench/`. This repo holds only original code. **No vendor firmware
 is shipped or needed** (see B1 below).
 
-**Status, 2026-09-23.**
+**Status, 2026-10-08.**
 - **Done:**
   - the plan and 12 example programs in `examples/`;
   - the **emulator**, `opendmp/emu/`: cycle-accurate, fed from files, and validated against
@@ -50,6 +50,16 @@ is shipped or needed** (see B1 below).
     division for every input, bit-exact on both rigs); a per-construct method report in
     `opendmp build` and the listing; ADD/RSUB chains for sums without products; hops at dead
     points.
+  - **2026-10-08**, after InvensenseDMP Findings 44–54 (§13 item 8):
+    - `n * m` on Ints is MUL then SHL 30 on the ICM (two instructions, not 32 steps);
+      `x >> 31` compiles (it crashed), and `x << k` works in place;
+    - `==` is RSUB then `test` for every pair (no XOR fallback, no −2.0 guard);
+    - the MPU's INC/DEC write R, so a MAC run after one into the same word starts from a move;
+    - the emulator rewrites the sample page under a long pass and caps the FIFO, keeping the
+      newest bytes; `Model` checks its values;
+    - `Rig.stop` pulses DMP_RST (clearing DMP_EN does not stop a pass);
+    - `opendmp run prog.asm` runs hand-written assembly on a rig (`--verify` replays it), and
+      `python -m opendmp.emu --sample` runs it without a sensor file.
 
 ## 1. Decisions (2026-09-23)
 
@@ -273,7 +283,7 @@ tilt.py ─ast─> front end ──> IR (typed values, storage classes, structur
    │             │            ├─ .lst .asm .bin .json (bundle)
    │             v            v
    └──> reference model   emulator (both chips)   ←→   rig (/dev/ttyUSB0, /dev/ttyUSB1)
-        (AST rewrite)     same Rig API: dmp.connect("emu:mpu6050") / dmp.connect("/dev/ttyUSB0")
+        (AST rewrite)     host.Rig / host.verify: python -m opendmp run [--verify]
 ```
 
 ```
@@ -285,10 +295,10 @@ opendmp/
   sim.py           SimResult: packets, interrupts, decoded fields, actual wraps, failed assumptions
   q30.py           the number model                                        [done]
   emu/             the cycle-accurate emulator, both chips                 [done, §8]
-    machine.py       state, step, pass; every unmeasured behaviour a Model switch
+    machine.py       state, step, pass; the rules a result rests on as Model switches (measured defaults)
     chips.py         memory geometry, clocks, the measured cycle table, sample layouts
-    sched.py         the pass timeline: ticks, rate drop (MPU) / 1/pass (ICM), tick stalls
-    files.py         sensor CSV (raw or SI units), program/RAM images, pokes, dmpasm sources
+    sched.py         the pass timeline: ticks, rate drop (MPU) / 1/pass (ICM), mid-pass samples, stalls
+    files.py         sensor CSV (raw or SI units) or one fixed sample, program/RAM images, pokes
     gen.py           synthetic sensor data (rest, tilt, rotate, walk, taps, vibration, ...)
     disasm.py        mode-aware disassembly for traces
     __main__.py      python -m opendmp.emu [run.toml] [options]
@@ -310,10 +320,11 @@ opendmp/
     ranges.py        interval analysis: where a value can wrap, with the fix; per-node intervals
     show.py          the IR as text
   backend/         layout, select, sched, flow, emit (asm/lst/bin/json)
-  host/            bridge.py (the ESP32 protocol, including W), rig.py, packets.py
-  cli.py           python -m opendmp check | sim | ir | dis | asm | facts   [done]; build | run to come
-examples/          12 programs (examples/README.md); examples/emu/ = a runnable emulator demo
-tests/             37 tests: hardware-transcribed ISA vectors, cycle counts, scheduling, the CLI
+  host/            bridge.py (the ESP32 protocol, including W), rig.py, verify.py
+  cli.py           python -m opendmp check | sim | ir | build | run | dis | asm | facts   [done]
+examples/          13 programs (examples/README.md); examples/emu/ = a runnable emulator demo
+tests/             hardware-transcribed ISA vectors, cycle counts, scheduling, every example
+                   against the reference on both chips, the host runtime, the CLI
 ```
 
 Implementation style: the core uses only the standard library (`ast`, `dataclasses`,
@@ -324,25 +335,26 @@ raises `Unmodelled` for anything with no measured meaning.
 
 ## 6. The hard parts
 
-### 6.1 Chip profiles (measured: ISA2.md Findings 37–42)
+### 6.1 Chip profiles (measured: ISA2.md Findings 37–54)
 
 | | mpu6050 (mantis) | icm20948 (DMP3) |
 |---|---|---|
 | data | 0x000–0x3FF, one block; never emit `bc`–`be` (the block persists across passes) | 0x0000–0x0FFF, blocks via `bc`–`be` (reset every pass) |
 | code | entry 0x0400, up to 0x0BFF (3 KB of memory in all) | entry 0x1000, **up to 0x2FFF** (8 KB): 0x3000–0x3FFF is the FIFO |
 | hardware-written RAM | **0x000–0x00D only**: ax ay az temp gx gy gz as int16 BE, every pass, only while the DMP runs (B2). 0x00E–0x00F are free | **0x0000–0x0011**: 0–3 cleared, then ax ay az gx gy gz temp (FSYNC is temp bit 0); **plus every FIFO byte, into 0x3000–0x3FFF** (B2) |
-| boot | **no vendor image** (B1): device reset (it keeps DMP memory), minimal registers, zero all memory, load, `DMP_CFG_1/2` = entry | the same (B1); HW_FIX_DISABLE / SINGLE_FIFO_PRIORITY_SEL not needed |
-| flag | **one flag F on both chips**; `d1` makes it result == 0; `d9` IF F, `da` IF ¬F; **no Z**. ADD/RSUB/MUL set the exact sign (RSUB: unless A = −2.0); **`f5` op 1 only tests signs** (Finding 40) | same |
+| boot | **no vendor image** (B1): device reset (it keeps DMP memory), minimal registers, zero all memory, load, `DMP_CFG_1/2` = entry | the same (B1), but the device reset writes 0x0080–0x0087; HW_FIX_DISABLE / SINGLE_FIFO_PRIORITY_SEL not needed |
+| flag | **one flag F on both chips**; `d1` makes it R's word == 0, R being the last ADD/RSUB/MUL/NMUL/MAC/INC/DEC result or CLAMP's compare (Finding 45); `d9` IF F, `da` IF ¬F; **no Z**. ADD/RSUB/MUL set the exact sign (RSUB: unless A = −2.0); **`f5` op 1 only tests signs** (Finding 40) | same |
 | control flow | **signed 6-bit branch: −32..+31 B** (`f4 41`–`7f` is the interrupt); **every `f4` leaves mode 4**, where a byte below 0x40 is a **one-byte branch** (Findings 40, 42); no absolute jump | 16-bit jump and call (4 deep), `e0`, loops; mode-4 hygiene |
-| multiply-accumulate | `f0`; **any destination move restarts the sum** | `f0` too; **only an op&4 pre-advance restarts it** |
+| multiply-accumulate | `f0`; R is the 64-bit accumulator; **a P2 move zeroes R, and that is the whole restart**: a MAC after INC/DEC/CLAMP continues from their result (Findings 44, 54) | `f0` too; **only a MAC's op&4 pre-advance restarts it**; MUL then SHL 30 is the integer product (Finding 46) |
 | `f2`/`f3` | **16-bit lanes, not just store widths**: `f3` computes on sign-extended low halves (a MUL there is tiny), `f2` on high halves; the same for `f6`/`f7` | same |
 | `f5` op 0 | **a symmetric clamp**: A ≥ 0 ? min(A, B) : max(A, −B); F := clamped (Finding 41) | same |
 | interrupt | `fe` | `e2` |
 | clock, cycles (cheap / MOV / ADD / MUL / MAC) | 8.199 MHz: 5 / 18 / 28 / 58 / 60 | 20.975 MHz: 4 / 17 / 26 / 25 / 27 |
 | pass start after the tick | 110 cycles (13.4 µs) | 130 cycles (6.2 µs) |
-| a sample write inside a pass | stalls it 14–28 cycles | no effect |
+| a sample write inside a pass | stalls it 14–28 cycles; the pass reads the new sample (Finding 47) | the pass reads the new sample (Finding 47) |
+| FIFO overflow | keeps the newest 1 KB (Finding 52) | a 4 KB ring at 0x3000, keeps the newest (Finding 52) |
 | prologue | `d8 f1` | `f1` first (mode 4 survives across passes), then `d8` |
-| state kept across passes | pointers, P2 index, route, mode, F; **not** the `fc`/`fd` exchange | pointers, mode 4, F |
+| state kept across passes | pointers, P2 index, route, mode, F, R; **not** the `fc`/`fd` exchange | route, mode (mode 4 too), F, R, the return stack; **pointers, P2 index and blocks restart** (Finding 51) |
 
 ### 6.2 Layout and pointer scheduling (the core problem)
 
@@ -360,7 +372,7 @@ graph) and stores nothing reads.
 
 The scheduler tracks the whole machine state: the three pointers (block, bank, page), the P2
 word index, routing, the mode register, the `fc`/`fd` toggles, `bf`, the predicate, mode 4, and
-what the MAC accumulator holds. It emits only the bytes that change state. At a join, state
+on the MPU whether R is 0 (the MAC restart). It emits only the bytes that change state. At a join, state
 that differs between the paths becomes unknown and is reloaded. At a loop head the state is the
 join of the entry and every back edge, found by iterating the schedule to a fixed point. **Width modes are lane modes**:
 nothing arithmetic may run under `f2`/`f3` unless a 16-bit lane op is intended.
@@ -436,7 +448,7 @@ compiler computes every condition under `d8` and ends every conditional region w
 ## 7. ISA facts the compiler depends on, and the bench work behind them
 
 `isa/facts.py` records every behaviour the backend relies on, with chip, status
-(HW / VENDOR / INFER / UNMEASURED) and source (`python -m opendmp facts`): 53 facts, 50 of them
+(HW / VENDOR / INFER / UNMEASURED) and source (`python -m opendmp facts`): 66 facts, 64 of them
 HW. The emulator's `Model` switches (defaults = measured) and `chips.py` (cycle counts with
 their probes) are the executable form of the same table.
 
@@ -444,17 +456,18 @@ their probes) are the executable form of the same table.
 |---|---|---|---|
 | B1 | Does a program run with **no vendor image** (RAM zeroed, only our code and data)? | both | **measured: yes** (probe91 B1). The count ran gapless, one pass per sample (10,003 µs at 100 Hz), and 26/26 and 29/29 packets matched the emulator bit for bit. A device reset keeps DMP memory |
 | B2 | Clobber map: which RAM does the hardware write? | both | **measured** (probe91 B2/FIFO): MPU 0x000–0x00d; ICM 0x0000–0x0011 plus **the FIFO at 0x3000–0x3fff**. Nothing while the DMP is off. MPU 0x00e's "constant 12" was a tag artefact |
-| B3 | What survives from pass to pass? | MPU | **measured**: pointers, P2 index, route, mode, F survive; `fc`/`fd` do not (probe86 C) |
-| B4 | What restarts the MAC sum? | both | **measured, and the chips differ**: MPU = any destination move; ICM = op&4 only (probe86 B, probe88) |
-| B5 | MAC precision and rounding | both | **measured**: exact products summed, floored once; MUL/NMUL floor (probe86 B, probe88) |
+| B3 | What survives from pass to pass? | both | **measured**: route, mode, F and R on both; the MPU keeps its pointers and P2 index, DMP3 restarts them; `fc`/`fd` do not (probe86 C, Finding 51) |
+| B4 | What restarts the MAC sum? | both | **measured, and the chips differ**: MPU = a P2 move, which zeroes R (and nothing else: Finding 54); ICM = a MAC's op&4 only (probe86 B, probe88, probe116) |
+| B5 | MAC precision and rounding | both | **measured**: exact products summed in a 64-bit register, floored once; MUL/NMUL floor and wrap mod 2³² (probe86 B, probe88, Finding 44) |
 | B6 | DMP3 `f0`, the `f5` family | ICM | **measured**: `f0` is the MAC; `f5`–`f7` as on the MPU (probe88) |
 | B7 | Clears under routing and widths | MPU | **measured**: a clear is a routed store of 0 and honours the lane (probe86 A) |
-| new | the flags | both | **one exact-sign F, no Z**; AND/XOR leave F alone; MIN sets F := a > b; `d1` tests the last adder result (probe86 E–H, probe88) |
+| new | the flags | both | **one exact-sign F, no Z**; AND/XOR leave F alone; CLAMP sets F := it clamped; `d1` tests R's word, R being the last ADD/RSUB/MUL/NMUL/MAC/INC/DEC result or CLAMP's compare (probe86 E–H, probe88, Finding 45) |
 | new | `f2`/`f3`/`f6`/`f7` | both | **16-bit lanes** (probe86 A/E/F, probe88) |
 | new | timing | both | **cycle counts, clocks, start latency, tick stalls** (probe90, with the bridge's new `W` command) |
 | new | control flow and compares, found by the first silicon runs | both | **every `f4` leaves mode 4** on the MPU too; the MPU branch is **signed 6-bit**; the `f5` "compare" **tests signs only**; RSUB's F is exact except A = −2.0; MOV/CLR/INC under every mode as modelled (probes 92–101, Finding 40) |
 | new | `f5` op 0, measured before compiling to it | both | **a symmetric clamp**, not MIN; F := clamped; lanes too (probe103, 1,920 cells per part, Finding 41) |
 | new | the MPU's mode-4 low bytes | MPU | **one-byte branches**, 10 cycles taken, predicable; no absolute jump; the vendor's eMD code chains hops with them (probe104, Finding 42) |
+| new | the edges, measured before the manual rewrite | both | the 64-bit MAC register and MUL's wrap (F44); what `test` reads (F45); DMP3's integer multiply (F46); nothing preempts a pass, the sample page moves under it (F47); all of each code space usable (F48); every cycle class (F49); INC/DEC into the FIFO (F50); the state a pass starts with (F51); FIFO overflow (F52); every manual example on silicon (F53); a MAC after a move continues from R (F54) (probes 106–116) |
 
 ## 8. How it is verified
 
@@ -464,7 +477,7 @@ their probes) are the executable form of the same table.
    0–3 (200/100/66.8/50 per second on silicon). From the cycle table alone it reproduces
    probe41's pass rates at all five sample rates, including the non-monotonic 500 Hz dip.
 2. **Unit tests** transcribed from the recorded probe results (probes 7/9, 32, 35, 47, 51, 53,
-   67–70, 74, 83b, 86, 88, 90, 91), plus cycle sums and scheduling.
+   67–70, 74, 83b, 86, 88, 90, 91, 106–116), plus cycle sums and scheduling.
 3. **The front end.** Every example lowers with no range warning. The reference and the IR
    interpreter agree bit for bit on every example, over every kind of synthetic motion, with
    no wrap and no failed assumption. Hand-computed words cover the rules where a plausible
@@ -538,7 +551,7 @@ mantis ISA, add later); the 3050 lineage; an optimal (ILP) layout.
    - "f0 on DMP3 is unmeasured";
    - the 0.58/2.0/3.9/7.9 µs + 56 µs timing model;
    - Finding 28's "d9 fires on 0", which was the op's own zero emit read as the marker.
-5. **Superseded by Finding 39** (manual chapters 6–8 corrected): MPU "0x00e reads a constant
+5. **Superseded by Finding 39** (the manual was corrected): MPU "0x00e reads a constant
    12" (probe84's own tag), and the ICM's "free RAM to 0x3fff" (the FIFO lives at
    0x3000–0x3fff).
 6. `dmpasm.py`'s mnemonics predate Findings 37–39 in places: `if le0`/`if ge0` on mantis (it is
@@ -551,3 +564,11 @@ mantis ISA, add later); the 3050 lineage; an optimal (ILP) layout.
    MPU too, and mode-4 low bytes are jumps (Finding 33's "no jump" is wrong for them); the
    `f5` op 1 "compare" tests signs only (Finding 37's "F := a − b < 0" rests on opposite-sign
    cells).
+8. **Superseded by Findings 44–54** (2026-10-08; the manual was rewritten for them, in the
+   MCS-51 manual's order): Finding 37's "`d1` tests the last adder result" (it reads the 64-bit
+   result register R, which INC, DEC and CLAMP also write); "the MAC accumulator resets every
+   pass" (R carries over); "DMP3 keeps its pointers across passes" (it restarts them); "any
+   destination move restarts the MPU's MAC" (the move zeroes R, and nothing else restarts it);
+   "`movz` makes MOV store zero" (it stores a FIFO-dependent value); "clearing DMP_EN stops the
+   DMP" (a running pass goes on). opendmp followed: the compiler, the emulator, `facts.py` and
+   `Rig.stop` (see the status, 2026-10-08).

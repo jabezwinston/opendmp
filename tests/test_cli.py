@@ -57,3 +57,11 @@ def test_model_values_are_checked(tmp_path):
     with pytest.raises(SystemExit, match="unknown xchgs"):
         main(["--load", str(tmp_path / "p.asm"), "--model", "carry=pointers,xchgs"])
     assert main(["--load", str(tmp_path / "p.asm"), "--model", "carry=none", "--model", "mac_precision=q30"]) == 0
+
+
+def test_asm_chip_picks_the_chip(tmp_path, capsys):
+    """An ICM .asm runs on the ICM without --chip (its .chip used to be overridden by the default)."""
+    (tmp_path / "i.asm").write_text(".chip icm\nfmode 1\nalways\nfifo\np0bank 1\np0page 0\nmov 0\nint\nend\n")
+    assert main(["--load", str(tmp_path / "i.asm"), "--poke", "0x100=0x01020304i", "--fifo", str(tmp_path / "o")]) == 0
+    assert (tmp_path / "o").read_bytes() == bytes.fromhex("01020304")
+    assert capsys.readouterr().out.startswith("icm20948: 1 passes")

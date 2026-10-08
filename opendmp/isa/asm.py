@@ -16,7 +16,7 @@ Branch, jump and call targets are labels or absolute addresses (`branch 0x042b`)
 disassembly prints absolute addresses, so it reassembles to the same bytes.
 
 The assembler tracks the mode register as the code falls through, and refuses an ALU mnemonic
-from the wrong family (`min` needs f5-f7, `mac` needs f0, `add` needs f1-f3) and, on DMP3, any
+from the wrong family (`clamp` needs f5-f7, `mac` needs f0, `add` needs f1-f3) and, on DMP3, any
 ALU op while mode 4 is set.  At a label that a branch, jump or call reaches, the mode is
 whatever the fall-through path left only if every path agrees; otherwise it is unknown and the
 code there must set it before its first ALU op.

@@ -5,9 +5,11 @@
     rig.write("limit", 0.1)                    # a param (or a state), by name, before or while running
     packets, ints = rig.run(seconds=5, watch=["angle"], changes=[(2.0, "limit", 0.3)])
     rig.read("angle"), rig.watched             # a state now; the watch log [(t, {name: value})]
+    rig.load_image(prog.image(), prog.entry, 50); rig.step()    # an assembled .asm: one pass
 
 The init is the minimal one measured in probe91: no image, no FIFO-rate patch, no I2C-master
-setup.  A device reset keeps DMP memory, so the loader clears it.
+setup.  A device reset keeps DMP memory (the ICM's writes 8 bytes at 0x0080-0x0087), so the
+loader writes all of it.
 """
 import time
 

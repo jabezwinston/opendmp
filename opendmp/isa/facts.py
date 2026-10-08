@@ -92,9 +92,10 @@ FACTS = [
          "lane", HW, "Finding 37, probe86 A/E/F, probe88"),
     Fact("alu.preadvance", BOTH, "op&4 advances the P2 word index before the store", HW,
          "Finding 17, probe32"),
-    Fact("mac.mode", BOTH, "Under f0 an ALU op is acc +/- A*B (op&1 = sign; op 2/3 = op 0/1), "
-         "storing the accumulator; a non-f0 op replaces the accumulator; it carries across passes",
-         HW, "Finding 30, probe74, probe88 (DMP3 f0 = MAC)"),
+    Fact("mac.mode", BOTH, "Under f0 an ALU op is R +/- A*B (op&1 = sign; op 2/3 = op 0/1), "
+         "storing R's word; R is the result register (flag.test says which ops replace it) and it "
+         "carries across passes", HW,
+         "Finding 30, probe74, probe88 (DMP3 f0 = MAC); Finding 45, probe107; Finding 51, probe113"),
     Fact("mac.precision", BOTH, "Products are summed in a 64-bit register (Q60 in [-8, 8), wrapping "
          "mod 2^64) and floored once; the stored word wraps mod 2^32; F is the register's sign bit",
          HW, "Finding 37, probe86 B; Finding 44, probe106"),
@@ -153,7 +154,7 @@ FACTS = [
          "shifts it (left s pulling the next word's fraction, or arithmetic right), stores the "
          "selected word and makes it R; every op that writes R reloads it from R (word 0 = R's "
          "word, word 1 = R's low 30 bits), so mul + shl 30 stores the integer product mod 2^32",
-         HW, "Findings 25, 64, probe51/64; Finding 46, probe110"),
+         HW, "Finding 25, probe51/64; Finding 46, probe110"),
     Fact("lo.icm", ICM, "d2/d3 store R's low 30 bits, sign-extended from bit 29: a product's, or "
          "a MAC run's sum", HW, "probe51; Finding 46, probe110"),
     Fact("movz.icm", ICM, "bf toggles a latch under which a MOV stores not its source but a value "

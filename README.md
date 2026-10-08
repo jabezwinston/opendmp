@@ -122,18 +122,18 @@ What the compiler does (PLAN.md §6):
 | example | MPU-6050 bytes | cycles/pass (max) | ICM-20948 bytes | cycles/pass (max) | packet |
 |---|---:|---:|---:|---:|---:|
 | hello_fifo | 11 | 204 | 12 | 217 | 6 |
-| tilt | 45 | 662 | 49 | 517 | 6 |
+| tilt | 45 | 672 | 49 | 529 | 6 |
 | pid_level | 56 | 1,043 | 55 | 711 | 8 |
-| goertzel | 61 | 1,190 | 63 | 771 | 4 |
-| vibration | 70 | 915 | 81 | 673 | 8 |
+| goertzel | 60 | 1,190 | 63 | 772 | 4 |
+| vibration | 70 | 983 | 81 | 726 | 8 |
 | gyro_quat | 80 | 2,255 | 90 | 1,307 | 16 |
-| pedometer | 95 | 1,101 | 108 | 869 | 8 |
+| pedometer | 95 | 1,121 | 108 | 873 | 8 |
 | biquad | 97 | 1,834 | 98 | 1,185 | 12 |
-| taps | 116 | 962 | 136 | 853 | 8 |
+| taps | 116 | 1,128 | 136 | 998 | 8 |
 | mahony | 190 | 4,575 | 221 | 2,668 | 16 |
-| despike | 341 | 3,094 | 383 | 2,705 | 12 |
-| unit_vectors | 359 | 15,780 | 261 | 11,099 | 28 |
-| slope (`x / y`) | 266 | 10,679 | 287 | 8,724 | 8 |
+| despike | 341 | 3,306 | 383 | 2,841 | 12 |
+| unit_vectors | 359 | 23,071 | 261 | 16,245 | 28 |
+| slope (`x / y`) | 266 | 11,467 | 287 | 9,433 | 8 |
 
 Cycles are the emulator's on walking and shaking motion. `opendmp build` also lists, per
 construct and line, the method it chose (`docs/language.md` §11). Every build also carries an
@@ -181,11 +181,25 @@ From Python: `from opendmp.host import Rig, verify`; `rig = Rig(port)`, `rig.loa
 `rig.run(seconds, watch=[...], changes=[(t, name, value)])`, `rig.read(name)`,
 `rig.write(name, value)`.
 
+Hand-written assembly runs the same way, loaded alone:
+
+```bash
+python -m opendmp run count.asm --port /dev/ttyUSB1 --passes 3 --poke 0x100=0x0f0f0f0f \
+    --dump 0x200:4 --verify
+```
+
+It assembles the file (for its `.chip`, or the bridge's part), runs one pass (or `--passes N`,
+or `--seconds`), and prints the FIFO and the `--dump` ranges. `--verify` replays the image in
+the emulator, which gives every pass `--sample` (zeros by default), and reports BIT-EXACT or
+each difference. From Python: `rig.load_image(image, entry, rate)`, `rig.step()`,
+`rig.run_raw(passes=3)`.
+
 ## The emulator
 
 ```bash
 python -m opendmp.emu run.toml                   # or everything as options, see --help
 python -m opendmp.emu --costs --chip icm20948    # the cycle table and where each number comes from
+python -m opendmp.emu --load prog.asm --sample ax=100,gz=-5 --passes 3 --fifo out.bin
 python -m opendmp.emu.gen walk,taps --rate 200 -o data.csv    # synthetic sensor data
 ```
 
@@ -195,7 +209,8 @@ from files:
 | input | format |
 |---|---|
 | sensor data | CSV, one row per sample tick; header names any of `ax ay az gx gy gz temp fsync` (or `accel_x` …). Raw int16 counts, or `units = "si"` for g, deg/s and deg C at the given full scales |
-| program and RAM | `load = ["prog.asm"]`: opendmp assembly, which places its own code and data. Or `"prog.bin@0x400"`: binary, `.hex` text, or `.s` assembled with InvensenseDMP's `dmpasm.py`. Load a whole RAM image the same way |
+| program and RAM | `load = ["prog.asm"]`: opendmp assembly, which places its own code and data (its `.chip` picks the chip). Or `"prog.bin@0x400"`: binary, `.hex` text, or `.s` assembled with InvensenseDMP's `dmpasm.py`. Load a whole RAM image the same way |
+| one fixed sample | `sample = "ax=100,gz=-5"`: with no sensor file, every pass sees this sample (zeros if omitted), for `passes` passes |
 | constants | `poke = ["0x100=0.98q,40000000"]`: Q30 values with a `q`, or raw hex words |
 | DMP3 I/O space | `regs = "regs.json"`: `{"bank:reg": value}`, what a page load under mode 4 reads |
 
@@ -230,20 +245,30 @@ Finding 38):
 | | MPU-6050 | ICM-20948 |
 |---|---:|---:|
 | clock (this bench's parts) | 8.199 MHz | 20.975 MHz |
-| predicate / mode / pointer / skipped byte | 5 | 4 |
+| predicate / mode / pointer / skipped byte / `int` | 5 | 4 |
+| CLR | 12 | 11 |
 | MOV | 18 | 17 |
+| CMP | 17 | 16 |
+| INC, DEC | 23 | 21 |
+| AND, XOR | 23 | 22 |
 | ADD, RSUB, CLAMP | 28 | 26 |
 | MUL | 58 | 25 |
 | MAC | 60 | 27 |
+| SHL, SAR | | 15 |
 | taken branch / jump | 15 | 13 |
+| a branch in mode 4 (one byte) | 10 | 9 |
+| call, ret | | 13, 5 |
 | sample tick → first instruction | 110 | 130 |
 
-`--costs` prints the full table, with the probe behind each number and which classes are still
-unmeasured (they fall back to a measured class and say so). The scheduler models what the
-sample clock does to a pass that overruns:
+On a 16-bit lane (`f2`/`f3`, `f6`/`f7`) the ALU ops are cheaper: ADD 22/20, MUL 52/19.
+
+`--costs` prints the full table with the probe behind each number. Only `end` is unmeasured
+(charged as a mode byte); the rows for instructions a core does not have say so too. The
+scheduler models what the sample clock does to a pass that overruns:
 - **MPU:** it drops to an integer submultiple of the rate, and every sample write inside a
   pass stalls it about 20 cycles.
 - **ICM:** it runs at 1/pass time.
+- **Both:** the pass reads the newer samples written while it runs, as silicon does.
 
 The clock is the bench parts' own; `--clock-mhz` takes yours.
 
@@ -251,6 +276,11 @@ The clock is the bench parts' own; `--clock-mhz` takes yours.
 
 - **Semantics.** 156 cells (probe86 on the MPU-6050, probe88 on the ICM-20948) run on silicon
   and in the emulator side by side; all match.
+- **The edges.** Probes 106–116 (Findings 44–54): the 64-bit MAC register, what `test` reads,
+  DMP3's integer multiply, pass carry, mid-pass samples, FIFO overflow. The emulator matches
+  every cell it models.
+- **The manual.** Every `asm` example in InvensenseDMP's manual gives its stated result in the
+  emulator (132 runs) and on silicon (62 on the MPU, 69 on the ICM).
 - **The vendor's firmware.** The stock MotionApps20 image (1929 B) emits its 42-byte packets at
   exactly the rates silicon does for FIFO-rate dividers 0–3. Its pass (20,465 cycles)
   reproduces the measured pass rates at five sample rates, including the non-monotonic dip at
@@ -258,16 +288,21 @@ The clock is the bench parts' own; `--clock-mhz` takes yours.
 - **Unit tests** (`pytest`) transcribe the recorded hardware results.
 
 Whatever has no measured meaning raises `Unmodelled` instead of being guessed: MPU `bf`,
-DMP3 `fc X Y` with X < 0xc0, both operand exchanges at once. The few behaviours that are
-unmeasured but unavoidable are named switches in `Model` (`--model key=value`), with the
-measured behaviour as the default.
+DMP3 `fc X Y` with X < 0xc0, DMP3 `fe`, a MOV under DMP3 `movz`, both operand exchanges at
+once. `Model` (`--model key=value`) names the rules a result rests on, such as how a MAC run
+restarts and what survives a pass: the defaults are the measured behaviour, the other values
+are for experiments, and an unknown value is refused.
 
-### Machine facts the emulator encodes that the manual does not (yet)
+### Machine facts the emulator encodes
 
-Measured for this project on 2026-09-23 (ISA2.md Findings 37–42):
+Measured for this project (ISA2.md Findings 37–54); InvensenseDMP's manual (`docs/manual/`)
+now states them all:
 - **One flag on both chips.** ADD, RSUB and MUL set F to the sign of the **exact** result
   (RSUB: unless A = −2.0, which it adds instead of subtracting). There is **no Z**: `d9` = IF F,
-  `da` = IF ¬F, `d1` makes F = (result == 0).
+  `da` = IF ¬F.
+- **`test` (`d1`) reads the result register R**: F := (R's word == 0), at the lane in force. R
+  holds the last ADD, RSUB, MUL, NMUL, MAC, INC or DEC result, or CLAMP's compare; AND, XOR,
+  CMP, MOV and CLR leave it. So RSUB then `test` is an exact `==` for every pair, −2.0 included.
 - **The `f5` "compare" tests signs only**: F := A < 0 ≤ B. Earlier probes had used operands of
   opposite signs, where it agrees with A − B < 0.
 - **The MPU's branch is signed**: `f4 d` reaches −32..+31 bytes. **Every `f4` leaves mode 4**
@@ -280,14 +315,25 @@ Measured for this project on 2026-09-23 (ISA2.md Findings 37–42):
   (1,920 cells per part, Finding 41). **AND/XOR** leave F alone.
 - **In the MPU's mode 4 a byte below 0x40 is a one-byte branch** (Finding 42): there is no
   absolute jump, but a branch after a branch costs one byte and 10 cycles.
-- **The MAC restarts** on any destination move on the MPU, but only on an `op&4` pre-advance on
-  the ICM. Products are summed exactly and floored once. **DMP3's `f0` is the MAC.**
-- **Across passes**, pointers, the P2 index, route, mode and F survive; the `fc`/`fd`
-  exchanges do not.
+- **R is the 64-bit MAC accumulator** (Q60 in [−8, 8), wrapping): products are summed exactly
+  and floored once, when stored. MUL wraps its word mod 2³² and keeps an exact-sign F. On the
+  MPU a P2 move zeroes R, and that is the whole restart: a MAC after INC, DEC or CLAMP adds to
+  their result. On the ICM only a MAC's own `op&4` restarts the sum. **DMP3's `f0` is the MAC.**
+- **DMP3 multiplies integers in two instructions**: MUL loads the shifter with the whole
+  product, and SHL 30 stores its low word (what `n * m` compiles to on the ICM).
+- **Across passes** both chips keep the route, mode, F and R. The MPU also keeps its pointers
+  and P2 index; DMP3 restarts them every pass, and keeps its return stack. The `fc`/`fd`
+  exchanges do not survive. After DMP_RST: route RAM, pointers 0, mode `f1`, F and R 0.
+- **Nothing preempts a pass.** Clearing DMP_EN lets a running pass go on (`Rig.stop` pulses
+  DMP_RST), and the sample page is rewritten at every tick, even under a running pass.
+  **The FIFO keeps the newest bytes**: 1 KB on the MPU, a 4 KB ring on the ICM.
 - **No vendor image is needed** (Finding 39). The hardware writes only the sample page:
-  0x000–0x00d on the MPU, and 0x0000–0x0011 on the ICM. **The ICM's FIFO is DMP RAM
-  0x3000–0x3fff**, so code must end below 0x3000; the emulator writes FIFO bytes there too.
-  A device reset keeps DMP memory.
+  0x000–0x00d on the MPU; on the ICM it clears 0x0000–0x0003 and writes 0x0004–0x0011.
+  **The ICM's FIFO is DMP RAM 0x3000–0x3fff**, so code must end below 0x3000; the emulator
+  writes FIFO bytes there too. A device reset keeps DMP memory, except that the ICM's writes
+  8 bytes at 0x0080–0x0087.
+- **DMP3's `movz`** makes MOV store a FIFO-dependent value, and its `fe` raises no interrupt:
+  use neither (the emulator refuses both).
 
 ## The ISA tools
 

@@ -9,8 +9,10 @@ Sensor data (CSV)
 
 Programs and memory
     FILE@ADDR     a binary loaded at ADDR (hex or decimal).  FILE.hex holds hex text instead,
-                  and FILE.s / FILE.asm is assembled with InvensenseDMP's tools/dmpasm.py
-                  (found through $OPENDMP_DMPASM or the sibling checkout).
+                  and FILE.s is assembled with InvensenseDMP's tools/dmpasm.py (found through
+                  $OPENDMP_DMPASM or the sibling checkout).
+    FILE.asm      opendmp assembly, with no @ADDR: it places itself (.org, .entry), and its
+                  .chip picks the chip unless one is given.
     ADDR=W,W,...  words poked at ADDR: hex ('40000000') or Q30 values with a q ('0.98q').
 """
 from __future__ import annotations

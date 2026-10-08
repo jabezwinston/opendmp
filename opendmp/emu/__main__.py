@@ -28,9 +28,11 @@ import argparse
 import csv
 import json
 import pathlib
+import re
 import sys
 import tomllib
 
+from ..isa.core import chip_name
 from ..q30 import from_q30
 from .chips import get_chip
 from .files import parse_addr, parse_load, parse_poke, parse_sample, read_asm, read_program, \
@@ -45,7 +47,7 @@ def build_parser():
     ap = argparse.ArgumentParser(prog="python -m opendmp.emu",
                                  description="Timed DMP emulator fed from files.")
     ap.add_argument("config", nargs="?", help="TOML file with any of the options below")
-    ap.add_argument("--chip", help="mpu6050 (default) or icm20948")
+    ap.add_argument("--chip", help="mpu6050 or icm20948 (default: a .asm's .chip, else mpu6050)")
     ap.add_argument("--rate", type=float, help="sample rate in Hz (default 200)")
     ap.add_argument("--sensors", help="sensor CSV, one row per sample tick")
     ap.add_argument("--sample", help="no CSV: every pass sees this sample, e.g. ax=100,gz=-5 "
@@ -109,9 +111,19 @@ def make_model(items) -> Model:
         raise SystemExit(f"--model: {e}") from None
 
 
+def asm_chip(loads):
+    """The .chip of the first opendmp .asm loaded, if it names one."""
+    for spec in loads:
+        f, addr = parse_load(spec)
+        if addr is None:
+            m = re.search(r"^\s*\.chip\s+(\w+)", pathlib.Path(f).read_text(), re.M)
+            return chip_name(m.group(1)) if m else None
+    return None
+
+
 def main(argv=None):
     o = merged_options(sys.argv[1:] if argv is None else argv)
-    chip = get_chip(o.get("chip", "mpu6050"),
+    chip = get_chip(o.get("chip") or asm_chip(o.get("load", [])) or "mpu6050",
                     float(o["clock_mhz"]) * 1e6 if o.get("clock_mhz") else None)
     if o.get("costs"):
         print(f"{chip.name}: {chip.clock_hz / 1e6:.3f} MHz ({chip.cycle_ns:.2f} ns/cycle); pass starts "

@@ -137,7 +137,7 @@ class Machine:
 
     # ------------------------------------------------------------------ state
     def power_on(self):
-        """The state after DMP_RST, as far as it is known (pointers and modes: INFER)."""
+        """The state after DMP_RST: pointers 0, route RAM, mode f1, F and R 0 [HW, Finding 51]."""
         self.p = [Ptr(), Ptr(), Ptr()]
         self.p2word = 0
         self.route_ram = True     # RAM after DMP_RST [HW, probe113]
