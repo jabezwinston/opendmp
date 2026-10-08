@@ -464,7 +464,14 @@ class Reference:
                         return
             sa, fa = self.unneg(node.left)
             sb, fb = self.unneg(node.right)
-            a, b = self.factor(fa, fr), self.factor(fb, fr)
+            va, vb = self.ev(fa, fr), self.ev(fb, fr)
+            if all(not is_const(v) and arith(v.t) == INT for v in (va, vb)):
+                from .. import lib             # n * m on Ints: the library's shift-and-add, as lowered
+                call = ast.fix_missing_locations(ast.copy_location(
+                    ast.Call(func=ast.Name("imul", ast.Load()), args=[fa, fb], keywords=[]), node))
+                out.append((coef * sa * sb, "val", self.run_function(lib.imul.fn, [va, vb], call, fr, sub=True)))
+                return
+            a, b = self.factor(fa, va), self.factor(fb, vb)
             out.append((coef * sa * sb, "prod", (a, b)))
             return
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div) and not fo.is_static(node.right):
@@ -478,7 +485,7 @@ class Reference:
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
             c = fo.fold(node.right)
             sa, fa = self.unneg(node.left)
-            out.append((coef * sa, "prod", (self.factor(fa, fr), to_q30(1 / c))))
+            out.append((coef * sa, "prod", (self.factor(fa, self.ev(fa, fr)), to_q30(1 / c))))
             return
         v = self.ev(node, fr)
         if is_const(v):
@@ -496,8 +503,7 @@ class Reference:
             node = node.operand
         return s, node
 
-    def factor(self, node, fr) -> int:
-        v = self.ev(node, fr)
+    def factor(self, node, v) -> int:
         return to_q30(float(v)) if is_const(v) else v.v
 
     # ------------------------------------------------------------------ conditions
@@ -577,6 +583,11 @@ class Reference:
                 acc = min(acc, self.raw(v, t)) if f.name == "min" else max(acc, self.raw(v, t))
             return R(t, acc)
         name = f.name
+        if name in ("raw", "q30"):            # the same word, another type
+            v = self.ev(node.args[0], fr)
+            if is_const(v):
+                return R(INT, to_q30(float(v))) if name == "raw" else R(Q30, s32(v))
+            return R(INT if name == "raw" else Q30, v.v)
         if name == "emit":
             for a in list(node.args) + [k.value for k in node.keywords]:
                 v = self.ev(a, fr)

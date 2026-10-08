@@ -332,6 +332,8 @@ class Analyser:
             else:
                 self.iv(e.x, env, None)
             return FULL
+        if isinstance(e, N.Cast):
+            return self.iv(e.x, env, where)       # the same word, so the same raw interval
         if isinstance(e, N.Assume):
             self.iv(e.x, env, where, quiet=True)
             return self.assumed(e.x.type, e.lo, e.hi)

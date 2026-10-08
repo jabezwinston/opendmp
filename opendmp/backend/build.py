@@ -547,7 +547,7 @@ def _routine_cost(name: str, chip: str) -> int:
         import textwrap
         import tempfile
         from ..api import Program
-        expr = {"div": "x / y", "idiv": "n // m"}[name]
+        expr = {"div": "x / y", "idiv": "n // m", "imul": "n * m"}[name]
         src = textwrap.dedent(f"""
             import opendmp as dmp
 
@@ -579,7 +579,7 @@ def _routine_cost(name: str, chip: str) -> int:
 
 
 def _with_cost(text: str, chip: str) -> str:
-    for tag, name in (("(dmp.div)", "div"), ("(dmp.idiv)", "idiv")):
+    for tag, name in (("(dmp.div)", "div"), ("(dmp.idiv)", "idiv"), ("(dmp.imul)", "imul")):
         if tag in text:
             c = _routine_cost(name, chip)
             us = c * get_chip(chip).cycle_ns / 1000

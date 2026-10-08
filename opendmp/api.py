@@ -65,6 +65,8 @@ def _dmp_only(name):
 emit = _dmp_only("emit")
 irq = _dmp_only("irq")
 clamp = _dmp_only("clamp")
+raw = _dmp_only("raw")              # dmp.raw(x): a Q30 value's word, as an Int (no instruction)
+q30 = _dmp_only("q30")              # dmp.q30(n): an Int's word, as a Q30 value (no instruction)
 assume = _dmp_only("assume")
 
 

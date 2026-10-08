@@ -404,7 +404,10 @@ class Selector:
         what = ("x / y (dmp.div): exact restoring division (the integer bit, then 30 fraction bits, "
                 "saturating); " if lib and sub.name == "div" else
                 "n // m (dmp.idiv): exact floor division of Int values (32 steps, as Python's //); "
-                if lib and sub.name == "idiv" else f"{sub.name}(): ")
+                if lib and sub.name == "idiv" else
+                "n * m (dmp.imul): the exact Int product modulo 2^32 by shift-and-add (32 steps; the "
+                "DMP's multiply keeps only the Q30 top of a product); " if lib and sub.name == "imul" else
+                f"{sub.name}(): ")
         if self.as_routine(sub):
             if sub not in self.routines:
                 self.routines[sub] = self.new_label(f"sub.{sub.name}")
@@ -494,8 +497,8 @@ class Selector:
             return self.const(e.value)
         if isinstance(e, N.Sensor):
             return self.sensor(e.field, e.loc)
-        if isinstance(e, N.Assume):
-            return self.operand(e.x)
+        if isinstance(e, (N.Assume, N.Cast)):
+            return self.operand(e.x)          # a Cast is the same word: no instruction
         t = self.temp()
         self.assign(t, e, e.loc)
         return t
@@ -523,7 +526,7 @@ class Selector:
     def assign(self, dst: Word, e, loc):
         if isinstance(e, (N.Load, N.Const, N.Sensor)):
             self.move(dst, self.operand(e), loc)
-        elif isinstance(e, N.Assume):
+        elif isinstance(e, (N.Assume, N.Cast)):
             self.assign(dst, e.x, loc)
         elif isinstance(e, N.Sum):
             self.sum_(dst, e, loc)
@@ -688,6 +691,70 @@ class Selector:
             self.emit(Alu("add", dst, dst, x, loc=loc) if positive else Alu("rsub", dst, x, dst, loc=loc))
         return True
 
+    @staticmethod
+    def digits(k: int, naf: bool) -> list[int]:
+        """k's digits, least significant first: binary, or the non-adjacent form (digits in
+        {-1, 0, 1}, no two adjacent nonzero: 7 = 8 - 1)."""
+        out, s, k = [], (1 if k > 0 else -1), abs(k)
+        while k:
+            d = (2 - k % 4 if k % 2 else 0) if naf else k % 2
+            out.append(s * d)
+            k = (k - d) // 2
+        return out
+
+    def scale_plan(self, V, naf: bool):
+        """sum(c * x) for integer c, by Horner's rule over the coefficients' digits: from the top
+        digit position down, double the accumulator, then add or subtract each x whose digit
+        there is +-1.  Every op wraps modulo 2^32, and so does the result, which is what the
+        language defines for a sum.  ("acc" stands for the accumulator; "rsub" a, b is b - a.)"""
+        ds = [(self.digits(c, naf), x) for c, x in V]
+        zero = self.const(0)
+        ops, lazy = [], None                      # lazy: (sign, x), the accumulator not yet written
+        for pos in range(max(len(d) for d, _ in ds) - 1, -1, -1):
+            if lazy is not None and lazy != "acc":
+                s, x = lazy
+                if s < 0:
+                    ops.append(("rsub", x, zero))
+                ops.append(("add", x, x) if s > 0 else ("add", "acc", "acc"))
+                lazy = "acc"
+            elif lazy == "acc":
+                ops.append(("add", "acc", "acc"))
+            here = [(d[pos], x) for d, x in ds if pos < len(d) and d[pos]]
+            for s, y in sorted(here, key=lambda t: -t[0]):
+                if lazy is None:
+                    lazy = (s, y)
+                elif lazy == "acc":
+                    ops.append(("add", "acc", y) if s > 0 else ("rsub", y, "acc"))
+                else:
+                    s0, x = lazy
+                    if s0 > 0:
+                        ops.append(("add", x, y) if s > 0 else ("rsub", y, x))
+                    elif s > 0:
+                        ops.append(("rsub", x, y))
+                    else:
+                        ops += [("rsub", x, zero), ("rsub", y, "acc")]
+                    lazy = "acc"
+        if lazy not in (None, "acc"):
+            s, x = lazy
+            ops.append(("mov", x, None) if s > 0 else ("rsub", x, zero))
+        elif lazy is None:
+            ops.append(("mov", zero, None))
+        return ops
+
+    def best_scale(self, V):
+        return min((self.scale_plan(V, naf) for naf in (False, True)), key=len)
+
+    def emit_scale(self, dst: Word, plan, xs, loc):
+        acc = self.temp("scale") if dst in xs else dst
+        for op, a, b in plan:
+            a, b = (acc if w == "acc" else w for w in (a, b))
+            if op == "mov":
+                self.move(acc, a, loc)
+            else:
+                self.emit(Alu(op, acc, a, b, loc=loc))
+        if acc is not dst:
+            self.move(dst, acc, loc)
+
     def sum_(self, dst: Word, e: N.Sum, loc):
         prods, plain = [], []
         for t in e.terms:
@@ -730,6 +797,15 @@ class Selector:
                     self.note(e.loc or loc, "one RSUB")
                     return self.emit(Alu("rsub", dst, x1, x2, loc=loc))
             n = len(self.ops)
+            expanded = sum(abs(c) for c, _ in V)
+            plan = self.best_scale(V)
+            chain = 2 <= expanded <= 8 and any(c > 0 for c, _ in V)    # add_chain's reach, roughly
+            # (an ADD costs no more than a MAC term: 28 vs 60 cycles on the MPU, 26 vs 27 on the ICM)
+            if len(plan) < expanded - 1 if chain else len(plan) <= expanded:
+                self.emit_scale(dst, plan, [x for _, x in V], loc)
+                self.note(e.loc or loc, f"{len(self.ops) - n} ADD/RSUB by doubling (Horner's rule on the "
+                                        "integer coefficients): the exact sum, modulo 2^32")
+                return
             if self.add_chain(dst, V, loc):
                 self.note(e.loc or loc, f"{len(self.ops) - n} ADD/RSUB in a chain (no products): the same "
                                         "value as the exact sum, modulo 2^32")
@@ -739,6 +815,15 @@ class Selector:
             self.note(e.loc or loc, "one MUL (floored)" if c == 1 else "one NMUL (floored)")
             return self.emit(Alu("mul" if c == 1 else "nmul", dst, a, b, loc=loc))
         one = self.const(ONE)
+        expanded = sum(abs(c) for c, _ in V)
+        if P and expanded > 2:                     # the plain part, scaled by doubling, enters once
+            plan = self.best_scale(V)
+            if len(plan) + 1 < expanded:
+                t = self.temp("plain")
+                self.emit_scale(t, plan, [x for _, x in V], loc)
+                self.note(e.loc or loc, f"the plain terms by {len(plan)} ADD/RSUB (doubling), then "
+                                        f"entering the multiply-accumulate run once")
+                V = [(1, t)]
         terms = []
         for c, a, b in P:
             terms += [(c < 0, a, b)] * abs(c)

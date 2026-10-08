@@ -53,8 +53,21 @@ Every value is one 32-bit word.
 | **Bits** | `dmp.bits(0xffff0000)` | a 32-bit mask: `&`, `^`, `\|`, `~`, `<<`, `>>` |
 
 **The literal picks the type, and a variable keeps it.** `x = 0.0` makes a Q30 variable, and
-`x = 1` into it later is an error (write `1.0`). An Int only scales by a constant integer, and
-Int arithmetic wraps at 32 bits.
+`x = 1` into it later is an error (write `1.0`). Int arithmetic wraps at 32 bits.
+
+**Why two types, when a Q30 is just an integer scaled by 2⁻³⁰?** For most instructions they are
+the same thing: ADD, RSUB, INC, compares, CLAMP, AND/XOR and moves give identical bits either
+way, and so does scaling by a whole number (`7 * x` is a sum of copies). The multiply is the
+exception. The DMP's MUL and MAC keep the top of the 64-bit product, (a·b) >> 30, which is the
+Q30 product, and they throw an integer product away (3 × 5 → 0). So `a * b` needs the type to
+mean one thing: on Q30 values it is one MUL, and on two Ints it is `dmp.imul`, built from adds.
+The type also fixes what a literal is: `3` is an Int, while `3.0` does not fit in Q30.
+
+**Reinterpreting a word.** `dmp.raw(x)` reads a Q30 value's word as an Int, and `dmp.q30(n)` reads
+an Int's word as Q30. The bits do not change and no instruction runs. Use them for bit-level work:
+`up + dmp.q30(1)` adds exactly one LSB (2⁻³⁰), and `dmp.raw(s.accel.x)` is the sample as a raw
+count (the 16-bit reading << 16). On constants they convert: `dmp.raw(0.5)` is 2²⁹, and
+`dmp.q30(1)` is 2⁻³⁰.
 
 **Constants.** These are folded in Python, exactly as written, then rounded to the nearest Q30
 when they meet a DMP value:
@@ -105,7 +118,8 @@ h: dmp.state = [0.0] * 4           # lists, nested lists: one word per element
 | construct | notes |
 |---|---|
 | `a + b`, `a - b`, `-a` | see the exact-sum rule below |
-| `a * b` | Q30 × Q30, floored; Int × constant integer |
+| `a * b` | Q30 × Q30: floored. Int × Int: the exact product modulo 2³², compiled to `dmp.imul(n, m)` (shift-and-add, 32 steps; up to about 1.0 ms on the MPU, 0.34 ms on the ICM). A constant integer factor scales either type exactly, by doublings |
+| `dmp.raw(x)`, `dmp.q30(n)` | the same word read as an Int or as Q30: no instruction (above) |
 | `x / y` | Q30 values: truncated toward zero, exact to the last bit, saturating at ±(2 − 2⁻³⁰) when the quotient reaches 2 or y is 0. It compiles to `dmp.div(x, y)` (below), which is also callable by that name |
 | `x / C`, `x * (1 / C)` | C a constant: a multiply by the reciprocal, rounded to Q30 (one MUL, not exact division) |
 | `n // m` | Int values: floor division exactly as Python's, for every 32-bit pair. `n // 0` and the one overflow, −2³¹ // −1, saturate at the Int limits. It compiles to `dmp.idiv(n, m)` (32 steps; about 2.7 ms on the MPU, 0.9 ms on the ICM) |
@@ -211,6 +225,7 @@ It costs about 10,700 cycles on the MPU (1.3 ms) and 8,700 on the ICM (0.4 ms) a
 | construct | hint |
 |---|---|
 | `n / m` on Int values, `x // y` on Q30 values | `/` divides Q30 values, `//` divides Int values |
+| an Int times a Q30 value | `n * m` multiplies two Ints and `x * y` two Q30 values; `dmp.q30(n)` reads an Int's word as Q30 |
 | `%` | `n - (n // m) * m` |
 | `math.sqrt(x)` of a DMP value, `x ** 2` | a Newton step; `x * x` |
 | a list index that is not a constant | unroll with `range(N)`; there is no indirect addressing |
@@ -272,7 +287,9 @@ restoring division ...; costs up to 10441 cycles = 1273 us each` on the MPU), no
 | `dmp.loop`, `while` | a counter or a condition, and a branch back |
 | `n += 1` on an Int | one INC |
 | a sum with no products (`a + b - c`, `r + r - b`) | a chain of ADD/RSUB: the same value modulo 2³² |
-| `x / y` (`dmp.div`), `n // m` (`dmp.idiv`) | the library routines (above) |
+| constant integer coefficients (`n * 100`, `7 * a - 3 * k`) | doublings, by Horner's rule on the coefficients' binary or signed digits (`n * 100`, 100 = 64 + 32 + 4: 8 ops, not a 100-term run); with products in the sum, the scaled plain part enters the multiply-accumulate run as one term |
+| `x / y` (`dmp.div`), `n // m` (`dmp.idiv`), `n * m` on Ints (`dmp.imul`) | the library routines (above) |
+| `dmp.raw(x)`, `dmp.q30(n)` | nothing: the same word |
 
 **The pass-time bound.** A build computes an upper bound on a pass
 (`build.cycles_max()`, the listing's last line and the `.json`):

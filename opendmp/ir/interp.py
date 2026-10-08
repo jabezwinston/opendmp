@@ -156,6 +156,8 @@ class Interp:
         if isinstance(e, N.Shift):
             v = self.ev(e.x)
             return s32(v << e.k) if e.op == "shl" else v >> e.k
+        if isinstance(e, N.Cast):
+            return self.ev(e.x)                   # the same bits
         if isinstance(e, N.Assume):
             v = self.ev(e.x)
             self.check(v, e.x.type, e.lo, e.hi, e.loc)

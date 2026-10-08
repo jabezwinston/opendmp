@@ -43,6 +43,8 @@ def expr(e) -> str:
         return f"({expr(e.x)} {'<<' if e.op == 'shl' else '>>'} {e.k})"
     if isinstance(e, N.Assume):
         return f"assume({expr(e.x)}, {e.lo:g}, {e.hi:g})"
+    if isinstance(e, N.Cast):
+        return f"{'raw' if e.type == N.INT else 'q30'}({expr(e.x)})"
     return f"<{type(e).__name__}>"
 
 

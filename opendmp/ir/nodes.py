@@ -133,6 +133,14 @@ class Shift(Expr):
 
 
 @dataclass(eq=False)
+class Cast(Expr):
+    """x's word, read as another type: dmp.raw (Q30 -> Int) and dmp.q30 (Int -> Q30).  The bits
+    do not change, so no instruction runs."""
+    x: Expr
+    type: str
+
+
+@dataclass(eq=False)
 class Assume(Expr):
     """The value of x, which the programmer asserts lies in [lo, hi]."""
     x: Expr

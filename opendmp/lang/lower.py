@@ -922,7 +922,12 @@ class Lowerer:
                         return
             sa, fa = self.strip_neg(node.left)
             sb, fb = self.strip_neg(node.right)
-            a, b = self.factor(fa), self.factor(fb)
+            va, vb = self.expr(fa), self.expr(fb)
+            if all(not isinstance(v, list) and not is_const(v) and N.arith_type(self.value(v, f).type) == N.INT
+                   for v, f in ((va, fa), (vb, fb))):
+                terms.append((coef * sa * sb, "val", self.multiply(node, fa, fb, va, vb), node))
+                return
+            a, b = self.factor(fa, va), self.factor(fb, vb)
             terms.append((coef * sa * sb, "prod", (a, b), node))
             return
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
@@ -933,7 +938,7 @@ class Lowerer:
             if not is_number(c) or c == 0:
                 raise self.err(f"division by {node_text(node.right)}", node.right)
             sa, fa = self.strip_neg(node.left)
-            a = self.factor(fa)
+            a = self.factor(fa, self.expr(fa))
             if not isinstance(a, N.Expr) or N.arith_type(a.type) != N.Q30:
                 raise self.err("/ divides Q30 values only", node, "Int and dmp.bits values do not divide")
             recip = N.Const(N.Q30, self.q30(1 / c, node.right, f"1 / {node_text(node.right)}"),
@@ -954,8 +959,7 @@ class Lowerer:
             node = node.operand
         return s, node
 
-    def factor(self, node) -> N.Expr:
-        v = self.expr(node)
+    def factor(self, node, v) -> N.Expr:
         if is_const(v):
             if not is_number(v):
                 raise self.err("dmp.bits do not multiply", node)
@@ -963,8 +967,8 @@ class Lowerer:
         e = self.value(v, node)
         t = N.arith_type(e.type)
         if t == N.INT:
-            raise self.err(f"{node_text(node)} is an Int: Int values only scale by a constant integer",
-                           node, "n * 3 is fine; a Q30 value times an Int is not")
+            raise self.err(f"{node_text(node)} is an Int, and the other factor is Q30", node,
+                           "n * m multiplies two Ints, x * y two Q30 values; dmp.q30(n) reads an Int's word as Q30")
         if t == N.BITS:
             raise self.err("dmp.bits values do not multiply", node, "use << for powers of two")
         return e
@@ -1124,6 +1128,26 @@ class Lowerer:
             lo_e, hi_e = self.as_type(lo, t, lo_n), self.as_type(hi, t, hi_n)
             return N.MinMax("min", N.MinMax("max", e, lo_e, t, loc=self.loc(node)), hi_e, t,
                             loc=self.loc(node))
+        if what in ("raw", "q30"):
+            (a,) = self.args(node, 1)
+            want_from, to = (N.Q30, N.INT) if what == "raw" else (N.INT, N.Q30)
+            v = self.expr(a)
+            if is_const(v):
+                if what == "raw":
+                    if not is_number(v):
+                        raise self.err("dmp.raw of a number", a)
+                    return N.Const(N.INT, self.q30(v, a, node_text(a)), loc=self.loc(node))
+                if not isinstance(v, int) or isinstance(v, bool):
+                    raise self.err("dmp.q30 of an integer: the raw word", a, "dmp.q30(1) is 2^-30")
+                return N.Const(N.Q30, s32(v), loc=self.loc(node))
+            if isinstance(v, list):
+                raise self.err(f"dmp.{what} of a value, not a list", a)
+            e = self.value(v, a)
+            if N.arith_type(e.type) != want_from:
+                raise self.err(f"dmp.{what} takes {self.tname(want_from)}, not {self.tname(e.type)}", a,
+                               "dmp.raw reads a Q30 word as an Int; dmp.q30 reads an Int word as Q30")
+            self.note(node, f"the same word read as {'an Int' if to == N.INT else 'Q30'}: no instruction")
+            return N.Cast(e, to, loc=self.loc(node))
         if what == "bits":
             return self.const_expr(node)
         if what == "loop":
@@ -1270,6 +1294,14 @@ class Lowerer:
             if isinstance(v, list) or N.arith_type(self.value(v, an).type) != N.Q30:
                 raise self.err("/ divides Q30 values", an, "Int values do not divide (counters count)")
         return self.call_sub(lib.div, vals, call)
+
+    def multiply(self, node, fa, fb, va, vb):
+        """n * m with two Int values: a call of dmp.imul (shift-and-add, opendmp/lib.py).  The DMP's
+        multiply keeps the top of the product (Q30), so an integer product is built from adds."""
+        from .. import lib
+        call = ast.fix_missing_locations(ast.copy_location(
+            ast.Call(func=ast.Name("imul", ast.Load()), args=[fa, fb], keywords=[]), node))
+        return self.call_sub(lib.imul, [va, vb], call)
 
     def floor_divide(self, node):
         """n // m with Int values: a call of dmp.idiv (floor division, opendmp/lib.py)."""

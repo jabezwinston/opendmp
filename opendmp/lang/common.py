@@ -14,7 +14,7 @@ FIELD_NAME = {"ax": "accel_x", "ay": "accel_y", "az": "accel_z", "gx": "gyro_x",
               "gz": "gyro_z", "temp": "temp", "fsync": "fsync"}
 CMP_OPS = {ast.Lt: "lt", ast.LtE: "le", ast.Gt: "gt", ast.GtE: "ge", ast.Eq: "eq", ast.NotEq: "ne"}
 CONST_BUILTINS = {"abs", "min", "max", "int", "float", "round", "len"}
-API_NAMES = {"emit", "irq", "clamp", "assume", "bits", "loop"}
+API_NAMES = {"emit", "irq", "clamp", "assume", "bits", "loop", "raw", "q30"}
 API_OBJECTS = {id(getattr(api, n)): n for n in API_NAMES}
 
 
@@ -105,7 +105,7 @@ def module_attr(base, attr, err):
         if attr == "quat":
             from .. import quat
             return quat
-        if attr in ("div", "idiv"):         # the standard library, written in the language
+        if attr in ("div", "idiv", "imul"):     # the standard library, written in the language
             from .. import lib
             return getattr(lib, attr)
         if attr in ("state", "param"):

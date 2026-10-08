@@ -234,3 +234,73 @@ def test_floor_division_matches_python(tmp_path):
             for bd in builds:
                 assert bd.emulate([Sample()], params={"n": a, "m": b}).packets == ref.packets, (a, b)
     assert any("n // m (dmp.idiv): exact floor division" in l for l in builds[0].explain())
+
+
+IMUL_SRC = '''
+import opendmp as dmp
+
+@dmp.program(rate=50)
+def im(s):
+    n: dmp.param = 0
+    m: dmp.param = 0
+    dmp.emit(p=n * m, q=-n * m)
+'''
+
+
+def test_int_product_matches_python(tmp_path):
+    """n * m on two Int values (dmp.imul, shift-and-add): Python's product modulo 2^32."""
+    f = tmp_path / "im.py"
+    f.write_text(IMUL_SRC)
+    p = runpy.run_path(str(f))["im"]
+    L = 1 << 31
+    s32 = lambda v: (v + L) % (1 << 32) - L      # noqa: E731
+    edge = [-L, -L + 1, -65536, -7, -1, 0, 1, 3, 46341, L - 1]
+    builds = [p.build(c) for c in CHIPS]
+    for a in edge:
+        for b in edge:
+            ref = p.simulate([Sample()], params={"n": a, "m": b})
+            pk = ref.packets[0]
+            got = [int.from_bytes(pk[i:i + 4], "big", signed=True) for i in (0, 4)]
+            assert got == [s32(a * b), s32(-a * b)], (a, b)
+            for bd in builds:
+                assert bd.emulate([Sample()], params={"n": a, "m": b}).packets == ref.packets, (a, b)
+    assert any("(dmp.imul): the exact Int product" in l for l in builds[0].explain())
+
+
+SCALE_SRC = '''
+import opendmp as dmp
+
+@dmp.program(rate=50)
+def sc(s):
+    n: dmp.state = 3
+    y: dmp.state = 0.0
+    n = n * 100 + 1
+    a = dmp.raw(s.accel.x)
+    up = y + dmp.q30(3)
+    y = s.accel.y * 7 + y * 3 - s.gyro.x * s.gyro.y + s.accel.z * 9
+    dmp.emit(n=n, m=7 * a - 3 * n, w=-a * 5, z=s.gyro.z * -3, k=s.gyro.z * 1000, up=up, y=y,
+             back=dmp.q30(a))
+'''
+
+
+def test_integer_scaling_and_casts(tmp_path):
+    """Constant integer coefficients by doubling (Horner), plain terms into a MAC run once,
+    and dmp.raw / dmp.q30 as free reinterpretations: bit-exact on both chips."""
+    f = tmp_path / "sc.py"
+    f.write_text(SCALE_SRC)
+    p = runpy.run_path(str(f))["sc"]
+    rnd = random.Random(5)
+    r16 = lambda: rnd.randint(-32768, 32767)     # noqa: E731
+    ss = [Sample(ax=r16(), ay=r16(), az=r16(), gx=r16(), gy=r16(), gz=r16()) for _ in range(60)]
+    ss += [Sample(ax=-32768, ay=-32768, az=-32768, gx=-32768, gy=-32768, gz=-32768)]
+    ref = p.simulate(ss)
+    for s, fl in zip(ss, ref.fields()):
+        assert fl["w"] == ((-(s.ax << 16) * 5 + (1 << 31)) % (1 << 32)) - (1 << 31)
+        assert fl["back"] == pytest.approx(s.ax / 16384)
+    for chip in CHIPS:
+        check(p, chip, ss)
+    notes = p.build("mpu6050").explain()
+    assert any("sc.py:8" in l and "ADD/RSUB by doubling" in l for l in notes)
+    assert any("sc.py:9" in l and "no instruction" in l for l in notes)
+    assert any("sc.py:11" in l and "entering the multiply-accumulate run once" in l for l in notes)
+    assert not any("multiply-accumulate run of" in l and "sc.py:12" in l for l in notes)

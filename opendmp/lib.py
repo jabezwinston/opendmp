@@ -105,3 +105,20 @@ def idiv(n, m):
                 if rn < 0:
                     q = q - 1
     return q
+
+
+@dmp.sub                         # ICM: one routine when called twice or more; MPU: inlined
+def imul(n, m):
+    """n * m on Int values: the exact product modulo 2^32, as Int arithmetic wraps.
+
+    The DMP's multiply keeps the top of a 64-bit product (Q30: (a*b) >> 30), so an integer
+    product is shift-and-add: m's 32 bits from the top, doubling the partial product each step
+    and adding n where the bit is 1 (two's complement makes this right for negative m too)."""
+    r = 0
+    d = m
+    for _ in dmp.loop(32):
+        r = r + r
+        if d < 0:                    # m's next bit (the top bit of what is left)
+            r = r + n
+        d = d + d
+    return r

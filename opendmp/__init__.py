@@ -17,9 +17,9 @@ sets are `opendmp.isa`.  See PLAN.md for what is built and what is next.
 __version__ = "0.0.1"
 
 from .api import (Bits, Program, Sub, assume, bits, clamp, emit, irq, loop, param, program,  # noqa: E402
-                  state, sub)
+                  q30, raw, state, sub)
 from . import quat  # noqa: E402
-from .lib import div  # noqa: E402
+from .lib import div, idiv, imul  # noqa: E402
 
 __all__ = ["Bits", "Program", "Sub", "assume", "bits", "clamp", "emit", "irq", "loop", "param",
-           "program", "state", "sub", "quat", "div"]
+           "program", "state", "sub", "quat", "div", "idiv", "imul", "raw", "q30"]
