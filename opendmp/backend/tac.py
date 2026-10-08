@@ -56,6 +56,13 @@ class Alu(Op):
 
 
 @dataclass(eq=False)
+class IMul(Alu):
+    """DMP3: dst := a * b mod 2^32, the integer product, as `mul` then `shl 30`.  The MUL loads the
+    shifter with its whole 64-bit product (InvensenseDMP Finding 46), so the two are emitted
+    together and nothing may come between them."""
+
+
+@dataclass(eq=False)
 class MacRun(Op):
     """dst := floor(sum of +-a*b), exactly: one MAC run from a fresh accumulator."""
     dst: Word
@@ -295,8 +302,13 @@ class Selector:
         if sub not in self.depth:
             self.depth[sub] = 0
             inner = count_calls(sub.body, {})
-            self.depth[sub] = max((1 + self.sub_depth(s) for s in inner), default=0)
+            self.depth[sub] = max((1 + self.sub_depth(s) for s in inner if not self.native(s)),
+                                  default=0)
         return self.depth[sub]
+
+    def native(self, sub) -> bool:
+        """A library sub the target computes in hardware instead: DMP3's integer product."""
+        return self.icm and sub.name == "imul" and sub.loc is not None and library_file(sub.loc.file)
 
     def as_routine(self, sub) -> bool:
         # the return stack is 4 deep and circular (Finding 33): main -> 4 nested routines at most
@@ -398,6 +410,11 @@ class Selector:
     def call_sub(self, s: N.CallSub):
         sub = s.sub
         vals = [self.operand(a) for a in s.args]
+        if self.native(sub):
+            self.note(s.loc, "n * m: MUL then SHL 30, 2 instructions (DMP3's shifter holds the whole "
+                             "64-bit product)")
+            self.emit(IMul("mul", self.word(s.outs[0]), vals[0], vals[1], loc=s.loc))
+            return
         for p, v in zip(sub.params, vals):
             self.move(self.word(p), v)
         lib = sub.loc is not None and library_file(sub.loc.file)
@@ -406,7 +423,7 @@ class Selector:
                 "n // m (dmp.idiv): exact floor division of Int values (32 steps, as Python's //); "
                 if lib and sub.name == "idiv" else
                 "n * m (dmp.imul): the exact Int product modulo 2^32 by shift-and-add (32 steps; the "
-                "DMP's multiply keeps only the Q30 top of a product); " if lib and sub.name == "imul" else
+                "MPU's multiply keeps only the Q30 top of a product); " if lib and sub.name == "imul" else
                 f"{sub.name}(): ")
         if self.as_routine(sub):
             if sub not in self.routines:
@@ -567,20 +584,40 @@ class Selector:
                 self.emit(Alu(e.op, dst, a, b, loc=loc))
         elif isinstance(e, N.Shift):
             x = self.operand(e.x)
-            if e.op == "shr":                      # x >> k = floor(x * 2^-k): a MUL
-                self.note(e.loc or loc, f"a MUL by 2^-{e.k}")
-                self.emit(Alu("mul", dst, x, self.const(1 << (30 - e.k)), loc=loc))
-            elif e.k == 0:
+            k = e.k
+            if k == 0:
                 self.move(dst, x, loc)
-            else:                                  # x << k: k doublings
-                self.note(e.loc or loc, f"{e.k} doublings (ADD)")
-                cur = x
-                for i in range(e.k):
-                    nxt = dst if i == e.k - 1 else self.temp()
-                    self.emit(Alu("add", nxt, cur, cur, loc=loc))
-                    cur = nxt
+            elif e.op == "shr" and k <= 30:        # x >> k = floor(x * 2^-k): a MUL, exact
+                self.note(e.loc or loc, f"a MUL by 2^-{k}")
+                self.emit(Alu("mul", dst, x, self.const(1 << (30 - k)), loc=loc))
+            elif e.op == "shr":                    # one MUL divides by at most 2^30
+                self.note(e.loc or loc, "two MULs: by 2^-30, then by 2^-1 (floor(x / 2^31), 0 or -1)")
+                self.emit(Alu("mul", dst, x, self.const(1), loc=loc))
+                self.emit(Alu("mul", dst, dst, self.const(1 << 29), loc=loc))
+            else:
+                self.shl(dst, x, k, e.loc or loc)
         else:
             raise TypeError(type(e).__name__)
+
+    def shl(self, dst: Word, x: Word, k: int, loc):
+        """x << k (1 <= k <= 31), modulo 2^32."""
+        if self.icm and k >= 2:
+            self.note(loc, f"MUL by 2^{k}, then SHL 30: the integer product (2 instructions)")
+            self.emit(IMul("mul", dst, x, self.const(1 << k), loc=loc))
+        elif k >= 16:                              # MPU: the low half up a lane, then doublings
+            self.note(loc, f"the low half moved up by a MOVX under the high lane (x << 16), then "
+                           f"{k - 16} doublings")
+            out = self.temp() if dst is x else dst
+            self.emit(Clr(out, loc=loc))
+            self.emit(Mov(out, x, swap=True, lane="hi", loc=loc))
+            for _ in range(k - 16):
+                self.emit(Alu("add", out, out, out, loc=loc))
+            self.move(dst, out, loc)
+        else:
+            self.note(loc, f"{k} doubling{'s' if k > 1 else ''} (ADD), in place")
+            self.emit(Alu("add", dst, x, x, loc=loc))
+            for _ in range(k - 1):
+                self.emit(Alu("add", dst, dst, dst, loc=loc))
 
     # ------------------------------------------------------------------ CLAMP (f5 op 0)
     # r = A >= 0 ? min(A, B) : max(A, -B), -B exact: A clamped to [-B, B] (ISA2 Finding 41)

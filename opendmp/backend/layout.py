@@ -136,7 +136,8 @@ def cost(ops, chip):
         if e.insn is None:
             continue
         op = e.insn.op
-        size += (1 if e.mode == 4 else 2) if op == "branch" else 3 if op == "jump" else 1
+        size += (1 if e.mode == 4 else 2) if op == "branch" else 3 if op == "jump" else \
+            2 if op in ("shl", "sar") else 1
         cyc += c.cyc(cost_key(e.insn, e.mode if e.mode is not None else 1))
     return size, cyc
 

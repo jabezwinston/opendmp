@@ -171,6 +171,12 @@ class Scheduler:
     def op_Alu(self, op):
         self.alu(op.op, op.dst, op.a, op.b)
 
+    def op_IMul(self, op):
+        # DMP3: the MUL loads the shifter with the whole product; SHL 30 stores a*b mod 2^32 over
+        # the MUL's own word (no advance), and makes it R (InvensenseDMP Finding 46)
+        self.alu("mul", op.dst, op.a, op.b)
+        self.put("shl", 30, False)
+
     def alu(self, name, dst, a, b):
         self.set_mode(MODE[name])
         self.set_route("fifo" if dst is T.FIFO else "ram")

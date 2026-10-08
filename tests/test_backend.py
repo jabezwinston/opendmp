@@ -328,3 +328,61 @@ def test_inc_then_mac_into_the_same_word(tmp_path, chip):
     f.write_text(INCMAC_SRC)
     p = runpy.run_path(str(f))["incmac"]
     check(p, chip, generate(["walk", "tilt"], rate=50, seconds=0.2))
+
+
+SHIFT_KS = (0, 1, 2, 15, 16, 17, 29, 30, 31)
+SHIFT_SRC = '''
+import opendmp as dmp
+
+@dmp.program(rate=50)
+def sh(s):
+    b: dmp.param = dmp.bits(0)
+    dmp.emit(''' + ", ".join(f"r{k}=b >> {k}, l{k}=b << {k}" for k in SHIFT_KS) + ''')
+'''
+
+
+@pytest.mark.parametrize("chip", CHIPS)
+def test_shifts_every_count(tmp_path, chip):
+    """>> k (k = 31: two MULs) and << k (in place; MPU k >= 16: a lane MOVX first; DMP3 k >= 2:
+    MUL then SHL 30) against Python's arithmetic shifts on a 32-bit word."""
+    f = tmp_path / "sh.py"
+    f.write_text(SHIFT_SRC)
+    p = runpy.run_path(str(f))["sh"]
+    bd = p.build(chip)
+    L = 1 << 31
+    s32 = lambda v: (v + L) % (1 << 32) - L      # noqa: E731
+    for v in (0, 1, -1, 3, -7, 0x12345678, s32(0x80000001), L - 1, -L):
+        ref = p.simulate([Sample()], params={"b": v})
+        pk = ref.packets[0]
+        got = [int.from_bytes(pk[i:i + 4], "big", signed=True) for i in range(0, len(pk), 4)]
+        want = [x for k in SHIFT_KS for x in (v >> k, s32(v << k))]
+        assert got == want, v
+        assert bd.emulate([Sample()], params={"b": v}).packets == ref.packets, v
+
+
+@pytest.mark.parametrize("chip", CHIPS)
+def test_shift_left_uses_no_temp_per_doubling(tmp_path, chip):
+    """<< 31 used to allocate a word per doubling (30 extra data words)."""
+    f = tmp_path / "sh2.py"
+    f.write_text(SHIFT_SRC.replace(", ".join(f"r{k}=b >> {k}, l{k}=b << {k}" for k in SHIFT_KS),
+                                   "x=b << 31, y=b << 15"))
+    bd = runpy.run_path(str(f))["sh"].build(chip)
+    assert len([w for w in bd.words if w.kind == "temp"]) <= 3
+
+
+def test_dmp3_int_product_is_two_instructions(tmp_path):
+    """DMP3 computes n * m as MUL then SHL 30 (Finding 46): random pairs, Python's product."""
+    f = tmp_path / "im.py"
+    f.write_text(IMUL_SRC)
+    p = runpy.run_path(str(f))["im"]
+    bd = p.build("icm20948")
+    assert any("MUL then SHL 30" in l for l in bd.explain())
+    assert "shl 30" in bd.asm() and bd.cycles_max() < 400
+    assert assemble(bd.asm()).code() == bytes(bd.image[bd.entry:bd.entry + len(assemble(bd.asm()).code())])
+    rnd = random.Random(46)
+    L = 1 << 31
+    s32 = lambda v: (v + L) % (1 << 32) - L      # noqa: E731
+    for _ in range(300):
+        a, b = s32(rnd.getrandbits(32)), s32(rnd.getrandbits(32))
+        got = bd.emulate([Sample()], params={"n": a, "m": b}).packets[0]
+        assert [int.from_bytes(got[i:i + 4], "big", signed=True) for i in (0, 4)] == [s32(a * b), s32(-a * b)]
