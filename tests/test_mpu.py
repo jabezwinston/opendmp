@@ -343,3 +343,16 @@ def test_probe113_pass_carry(chip):
     m.run_pass(Sample())
     m.begin_pass(Sample())
     assert m.p[0].addr() == (0 if chip == "icm20948" else 0x250)
+
+
+@pytest.mark.parametrize("chip", ["mpu6050", "icm20948"])
+@pytest.mark.parametrize("body,want", [
+    ("fmode 1\ninc\n", 0x40000001), ("fmode 1\ndec\n", 0x3FFFFFFF), ("fmode 1\ninc\ninc\n", 0x40000002),
+    ("fmode 5\nclamp 0,0\n", 2),
+])
+def test_probe116_mac_continues_after_a_move(chip, body, want):
+    """After a P2 move, a MAC continues from what INC, DEC or CLAMP wrote into R: on the MPU the
+    move zeroes R and that is all the restart there is (silicon, both parts, probe116)."""
+    x, y = (5, 7) if "clamp" in body else (3, 3)
+    m = _r_cell(chip, x, y, "p2page 2\n" + body, "fmode 0\nmac 2,2\nend\n")
+    assert m.peek_word(0x120) & 0xFFFFFFFF == want

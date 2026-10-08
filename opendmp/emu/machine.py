@@ -142,7 +142,6 @@ class Machine:
         self.ints = 0
         self.pc = self.entry
         self.halted = False
-        self._fresh = True        # the destination moved since the last MAC op (MPU rule)
         self._note = ""
         self._skip_len = 1
 
@@ -212,8 +211,6 @@ class Machine:
             self.f = False
         self.pc = self.entry
         self.halted = False
-        if "acc" not in carry:
-            self._fresh = True
 
     def run_pass(self, sample: Sample | None = None) -> PassResult:
         self.begin_pass(sample)
@@ -343,9 +340,9 @@ class Machine:
 
     def _moved(self):
         """The destination moved (a P2 page or bank load, d0, df, an op&4, an advancing MOV).  On
-        the MPU that restarts a MAC sum by zeroing R, so d1 then reads zero; DMP3 keeps R (only an
-        ALU op's own op&4 restarts its sum) [HW, probe86 B, probe88, probe107]."""
-        self._fresh = True
+        the MPU that zeroes R, which is the whole of its MAC restart: a MAC continues from whatever
+        wrote R after the move (an INC, a DEC, a CLAMP's compare) [HW, probe107, probe116].  DMP3
+        keeps R; only a MAC op's own op&4 starts its sum afresh [HW, probe88]."""
         if self._mac_rule() == "move":
             self.acc = 0
 
@@ -592,8 +589,8 @@ class Machine:
         if mode == 0:                               # multiply-accumulate [HW, probe74/86]
             prod = -(a * b) if op & 1 else a * b
             rule = self._mac_rule()
-            if (rule == "move" and self._fresh) or (rule == "op" and op & 4):
-                self.acc = 0
+            if rule == "op" and op & 4:             # DMP3: the op's own advance restarts the sum;
+                self.acc = 0                        # the MPU's restart is _moved() zeroing R
             if q60:                                 # a 64-bit register: Q60 in [-8, 8), wrapping;
                 acc = (self.acc + prod) & ((1 << 64) - 1)   # F is its sign bit [HW, probe106]
                 self.acc = acc - (1 << 64) if acc >> 63 else acc
@@ -650,7 +647,6 @@ class Machine:
                 self.acc = prod                     # R keeps the whole product [HW, probe110]
             else:
                 self._set_r(racc)                   # the op's exact result replaces R
-        self._fresh = False
         if mode == 0 or racc is not None:
             self._load_shifter()
         if store:

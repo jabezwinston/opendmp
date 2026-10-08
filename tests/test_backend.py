@@ -304,3 +304,27 @@ def test_integer_scaling_and_casts(tmp_path):
     assert any("sc.py:9" in l and "no instruction" in l for l in notes)
     assert any("sc.py:11" in l and "entering the multiply-accumulate run once" in l for l in notes)
     assert not any("multiply-accumulate run of" in l and "sc.py:12" in l for l in notes)
+
+
+INCMAC_SRC = '''
+import opendmp as dmp
+
+@dmp.program(rate=50)
+def incmac(s):
+    x: dmp.state = 0.25
+    g: dmp.param = 0.5
+    x = x + dmp.q30(1)
+    x = x * g + s.accel.x * g
+    dmp.emit(x=x)
+'''
+
+
+@pytest.mark.parametrize("chip", CHIPS)
+def test_inc_then_mac_into_the_same_word(tmp_path, chip):
+    """An INC (or DEC) writes R, and on the MPU a MAC after a P2 move continues from R
+    (InvensenseDMP Finding 54): a MAC run into the word an INC just changed must still start a
+    fresh sum.  emulate == reference on both chips."""
+    f = tmp_path / "incmac.py"
+    f.write_text(INCMAC_SRC)
+    p = runpy.run_path(str(f))["incmac"]
+    check(p, chip, generate(["walk", "tilt"], rate=50, seconds=0.2))

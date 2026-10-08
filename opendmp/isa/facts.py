@@ -99,8 +99,9 @@ FACTS = [
          "mod 2^64) and floored once; the stored word wraps mod 2^32; F is the register's sign bit",
          HW, "Finding 37, probe86 B; Finding 44, probe106"),
     Fact("mac.restart.mpu", MPU, "Any move of the destination zeroes R, restarting the sum: an "
-         "op&4, a P2 page or bank load, d0, df, an advancing MOV", HW,
-         "Finding 37, probe86 B; Finding 45, probe107"),
+         "op&4, a P2 page or bank load, d0, df, an advancing MOV.  That is the whole restart: a MAC "
+         "continues from anything that writes R after the move (INC, DEC, CLAMP's compare)", HW,
+         "Finding 37, probe86 B; Finding 45, probe107; Finding 54, probe116"),
     Fact("mac.restart.icm", ICM, "Only an ALU op's own op&4 restarts the sum; P2 moves keep R", HW,
          "Finding 37, probe88; Finding 45, probe107"),
     # --- moves, routing, pointers ----------------------------------------------------------

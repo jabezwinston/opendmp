@@ -2,7 +2,8 @@
 
 It tracks the machine state an instruction depends on and emits only what changes:
   the three pointers (bank, page), P2's walked word index, the mode register, the route,
-  and on the MPU whether the destination moved since the last ALU op (the MAC restart rule).
+  and on the MPU whether R is 0: a P2 move zeroes it, an ALU op or INC/DEC writes it, and a MAC
+  run starts afresh only from a zero R (InvensenseDMP Findings 45 and 54).
 At a label the state is what every way in agrees on (recorded at each branch); a label reached
 by a conditional branch starts with `always` (the predicate is still armed there), and on the
 ICM a label reached by a jump starts by leaving mode 4.
@@ -28,7 +29,7 @@ class State:
     p2i: int | None = None         # P2's word index
     mode: int | None = None
     route: str | None = None       # "ram" | "fifo"
-    fresh: bool | None = None      # MPU: the destination moved since the last ALU op
+    fresh: bool | None = None      # MPU: R is 0 (a P2 move since the last write of R)
 
     def copy(self):
         return State(list(self.p), self.p2i, self.mode, self.route, self.fresh)
@@ -212,7 +213,7 @@ class Scheduler:
                 self.st.p2i = need
             first_inc = True
         else:
-            # the destination must have moved since the last ALU op (any move restarts it)
+            # R must be 0: a P2 move zeroes it, and nothing may write it after the move
             if not same:
                 self.set_ptr(2, dst.addr, force=True)
             s = (widx - self.st.p2i) % 4
@@ -259,7 +260,7 @@ class Scheduler:
         self.set_route("ram")
         inc = self.seek(op.dst)
         self.put(("dec" if op.dec else "inc") + (".next" if inc else ""))
-        self.stored(op.dst, inc, False)
+        self.stored(op.dst, inc, True)          # INC/DEC write R: a MAC would continue from it
 
     def op_BranchIf(self, op):
         self.put("if f" if op.when else "if nf")
