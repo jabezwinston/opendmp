@@ -89,21 +89,31 @@ class Rig:
         if build.chip != self.chip:
             raise ValueError(f"a {build.chip} build on a {self.chip}")
         o = build.ir.opts
-        self.init(rate or o["rate"], o["gyro_fs"], o["accel_fs"], fsync=build.fsync)
+        self.load_image(build.image, build.entry, rate or o["rate"], o["gyro_fs"], o["accel_fs"],
+                        fsync=build.fsync, verify=verify)
+        self.build = build
+
+    def load_image(self, image, entry: int, rate: float, gyro_fs: int = 2000, accel_fs: int = 2,
+                   fsync: bool = False, verify: bool = True):
+        """The same for a raw memory image (an assembled .asm): reset, init, clear and write all
+        of DMP memory (up to the ICM's FIFO), read it back, set the entry."""
+        self.init(rate, gyro_fs, accel_fs, fsync=fsync)
         end = CLEAR[self.chip]
-        img = bytes(build.image[:end])
+        img = bytes(image[:end]).ljust(end, b"\0")
         self.b.mem_write(0, img)
         if verify:
             back = self.b.mem_read(0, end)
             if back != img:
                 bad = next(i for i in range(end) if back[i] != img[i])
                 raise IOError(f"load verify failed at {bad:#06x}")
-        e = build.entry
+        self.set_entry(entry)
+        self.build = None
+
+    def set_entry(self, e: int):
         if self.chip == "mpu6050":
             self.b.wr(0x70, bytes([e >> 8, e & 0xFF]))  # DMP_CFG_1/2
         else:
             self.reg(2, 0x50, bytes([e >> 8, e & 0xFF]))   # PRGM_START_ADDRH/L
-        self.build = build
 
     # ------------------------------------------------------------------ state and params
     def _word(self, name):
@@ -163,6 +173,45 @@ class Rig:
         else:
             self.reg(0, 0x03, 0x48)                     # FIFO_EN | DMP_RST
             self.reg(0, 0x03, 0x40)
+
+    def step(self, timeout_ms: int = 100) -> tuple[int, int]:
+        """One pass: the bridge's T (reset and start the DMP, wait for its first interrupt, stop
+        it); (interrupts, microseconds).  The program must raise `int` to end the wait early."""
+        if self.chip == "icm20948":
+            self.reg(0, 0x68, 0x1F)                     # FIFO_RST (the MPU's T resets it itself)
+            self.reg(0, 0x68, 0x1E)
+        n, us = map(int, self.b.cmd(f"T {timeout_ms}").split())
+        self.stop()
+        return n, us
+
+    def fifo_all(self) -> bytes:
+        """Drain the FIFO."""
+        out = bytearray()
+        n = self.b.fifo_count()
+        while n > 0:
+            chunk = self.b.fifo_read(min(n, 128))
+            if not chunk:
+                break
+            out += chunk
+            n -= len(chunk)
+        return bytes(out)
+
+    def run_raw(self, seconds: float | None = None, passes: int | None = None,
+                timeout: float = 10.0) -> tuple[bytes, int]:
+        """Run until `seconds` pass or `passes` interrupts arrive, reading the FIFO as it fills;
+        (FIFO bytes, interrupts).  For programs with no build (raw images)."""
+        data = bytearray()
+        self.start()
+        t0 = time.time()
+        try:
+            while time.time() - t0 < (seconds if seconds is not None else timeout):
+                data += self.fifo_all()
+                if passes is not None and self.b.ints() >= passes:
+                    break
+        finally:
+            self.stop()
+        data += self.fifo_all()
+        return bytes(data), self.b.ints()
 
     def run(self, seconds: float, watch=(), period: float = 0.25, changes=()):
         """Run the loaded program, reading the FIFO as it fills; (packets, interrupt count).

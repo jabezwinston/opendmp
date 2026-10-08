@@ -17,7 +17,10 @@ command line override the file.  Example run.toml:
     trace = "trace.txt"             # instruction trace ...
     trace_passes = 2                # ... of the first N passes
     watch = ["0x11c"]               # RAM words logged each pass (Q30 in the log)
-    model = ["mac_restart=advance"] # see opendmp.emu.machine.Model
+    model = ["mac_precision=q30"]   # see opendmp.emu.machine.Model (defaults: measured)
+
+With no `sensors`, every pass sees one fixed sample: `sample = "ax=100,gz=-5"` (zeros if
+omitted), for `passes` passes (default 1).
 """
 from __future__ import annotations
 
@@ -30,7 +33,8 @@ import tomllib
 
 from ..q30 import from_q30
 from .chips import get_chip
-from .files import parse_addr, parse_load, parse_poke, read_asm, read_program, read_sensor_csv
+from .files import parse_addr, parse_load, parse_poke, parse_sample, read_asm, read_program, \
+    read_sensor_csv
 from .machine import DmpFault, Machine, Model, Unmodelled
 from .sched import run, summary
 
@@ -44,6 +48,8 @@ def build_parser():
     ap.add_argument("--chip", help="mpu6050 (default) or icm20948")
     ap.add_argument("--rate", type=float, help="sample rate in Hz (default 200)")
     ap.add_argument("--sensors", help="sensor CSV, one row per sample tick")
+    ap.add_argument("--sample", help="no CSV: every pass sees this sample, e.g. ax=100,gz=-5 "
+                                     "(default: zeros)")
     ap.add_argument("--units", choices=("raw", "si"))
     ap.add_argument("--accel-fs", type=float, help="accel full scale in g for --units si (default 2)")
     ap.add_argument("--gyro-fs", type=float, help="gyro full scale in deg/s for --units si (default 2000)")
@@ -86,18 +92,21 @@ def merged_options(argv):
 
 
 def make_model(items) -> Model:
-    m = Model()
+    kw = {}
     for it in items or []:
         k, v = it.split("=", 1)
         k = k.strip()
         if k not in MODEL_FIELDS:
             raise SystemExit(f"unknown model key {k!r} (known: {', '.join(sorted(MODEL_FIELDS))})")
         if k == "carry":
-            v = tuple(x for x in v.split(",") if x.strip()) if v.strip() not in ("", "none") else ()
+            v = tuple(x.strip() for x in v.split(",") if x.strip()) if v.strip() not in ("", "none") else ()
         elif k == "max_steps":
             v = int(v)
-        setattr(m, k, v.strip() if isinstance(v, str) else v)
-    return m
+        kw[k] = v.strip() if isinstance(v, str) else v
+    try:
+        return Model(**kw)
+    except ValueError as e:
+        raise SystemExit(f"--model: {e}") from None
 
 
 def main(argv=None):
@@ -109,10 +118,12 @@ def main(argv=None):
               f"{chip.start_cycles} cycles after the tick; {chip.tick_stall_cycles} cycles per tick stall")
         for k, c, ns, src in chip.cost_report():
             print(f"  {k:8s} {c:3d} cycles  {ns / 1000:7.3f} us   {src}")
-        if not o.get("sensors"):
+        if not o.get("load"):
             return 0
-    if not o.get("sensors"):
-        raise SystemExit("no sensor data: give --sensors FILE.csv (see --help)")
+    if not o.get("load"):
+        raise SystemExit("nothing to run: give --load FILE (see --help)")
+    if o.get("sensors") and o.get("sample") is not None:
+        raise SystemExit("--sensors and --sample: give one")
     rate = float(o.get("rate", 200))
     regs = None
     if o.get("regs"):
@@ -134,8 +145,16 @@ def main(argv=None):
         m.poke_words(addr, words)
     if "entry" in o:
         m.entry = parse_addr(o["entry"])
-    samples = read_sensor_csv(o["sensors"], o.get("units", "raw"), o.get("accel_fs", 2),
-                              o.get("gyro_fs", 2000), chip.name)
+    if o.get("sensors"):
+        samples = read_sensor_csv(o["sensors"], o.get("units", "raw"), o.get("accel_fs", 2),
+                                  o.get("gyro_fs", 2000), chip.name)
+    else:
+        try:
+            one = parse_sample(o.get("sample", ""), o.get("units", "raw"), o.get("accel_fs", 2),
+                               o.get("gyro_fs", 2000), chip.name)
+        except ValueError as e:
+            raise SystemExit(str(e)) from None
+        samples = [one] * int(o.get("passes") or 1)
     watch = [parse_addr(w) for w in o.get("watch", [])]
 
     trace_f = open(o["trace"], "w") if o.get("trace") else None

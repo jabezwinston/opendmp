@@ -2,6 +2,7 @@
 
     python -m opendmp build prog.py --chip mpu6050  compile: .lst .asm .bin .json in build/
     python -m opendmp run prog.py --port /dev/ttyUSB0 [--verify]   on a bench rig (ESP32 bridge)
+    python -m opendmp run prog.asm --port /dev/ttyUSB0 [--passes N] [--dump 0x100:16] [--verify]
     python -m opendmp check prog.py                 parse, type, and look for values that can wrap
     python -m opendmp sim prog.py --gen walk,taps   run it on sensor data (or --sensors data.csv;
                                                     --engine emu:icm20948 runs the compiled bytes)
@@ -15,6 +16,7 @@ The emulator is `python -m opendmp.emu`.
 import argparse
 import csv
 import pathlib
+import re
 import runpy
 import sys
 
@@ -205,6 +207,13 @@ def cmd_build(a):
 
 
 def cmd_run(a):
+    if a.file.lower().endswith(".asm"):
+        return cmd_run_asm(a)
+    asm_only = [o for o, v in (("--passes", a.passes), ("--dump", a.dump), ("--poke", a.poke),
+                               ("--sample", a.sample), ("--fsync", a.fsync)) if v]
+    if asm_only:
+        raise SystemExit(f"{', '.join(asm_only)}: for a .asm program only")
+    a.seconds = 3.0 if a.seconds is None else a.seconds
     from .host import Rig, verify
     from .sim import decode
     progs = load_programs(a.file, a.name)
@@ -266,6 +275,90 @@ def _run(a, p, rig, verify, decode):
                 w.writerow([i] + [d[n] for n in names])
         print(f"  wrote {a.output}")
     return 0 if ok else 1
+
+
+def cmd_run_asm(a):
+    """An assembled .asm on a rig: load it alone (no vendor image), run one pass (or N, or for a
+    time), print the FIFO and any RAM dumps; --verify replays it in the emulator."""
+    from .emu import Machine
+    from .emu.files import parse_poke, parse_sample
+    from .host import Rig
+    from .host.rig import CLEAR
+    from .isa import AsmError, assemble
+    text = pathlib.Path(a.file).read_text()
+    has_chip = re.search(r"^\s*\.chip\b", text, re.M) is not None
+    try:
+        prog = assemble(text) if has_chip else None      # catch mistakes before the bridge
+        pokes = [parse_poke(s) for s in a.poke]
+        dumps = [(int(x, 0), int(n, 0)) for x, _, n in (d.partition(":") for d in a.dump)]
+        sample = parse_sample(a.sample or "")
+    except (AsmError, ValueError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    rig = Rig(a.port)
+    try:
+        prog = prog or assemble(text, rig.chip)              # no .chip: the bridge's part
+        if prog.chip != rig.chip:
+            print(f"error: {a.file} is for the {prog.chip}; the bridge has the {rig.chip}", file=sys.stderr)
+            return 1
+        image = prog.image()
+        if any(image[CLEAR[rig.chip]:]):
+            print(f"error: {a.file} places bytes at or above {CLEAR[rig.chip]:#06x}", file=sys.stderr)
+            return 1
+        rig.load_image(image, prog.entry, a.rate or 50, a.gyro_fs, a.accel_fs, fsync=a.fsync)
+        for addr, ws in pokes:
+            rig.b.mem_write(addr, b"".join((w & 0xFFFFFFFF).to_bytes(4, "big") for w in ws))
+        us = None
+        if a.seconds is not None:
+            data, ints = rig.run_raw(seconds=a.seconds)
+        elif (a.passes or 1) == 1:
+            ints, us = rig.step()
+            data = rig.fifo_all()
+        else:
+            data, ints = rig.run_raw(passes=a.passes)
+        got = [(addr, rig.b.mem_read(addr, n)) for addr, n in dumps]
+    except AsmError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    finally:
+        rig.close()
+    print(f"{pathlib.Path(a.file).name} on the {rig.chip}: {ints} interrupt{'s' * (ints != 1)}"
+          + (f" ({us} us from the start to the first)" if us and ints else "")
+          + f", FIFO {len(data)} B")
+    for i in range(0, len(data), 32):
+        print(f"  fifo {i:5d}  " + " ".join(data[j:j + 4].hex() for j in range(i, min(i + 32, len(data)), 4)))
+    for addr, mem in got:
+        print(f"  {addr:#06x}  " + " ".join(mem[j:j + 4].hex() for j in range(0, len(mem), 4)))
+    if a.output:
+        pathlib.Path(a.output).write_bytes(data)
+        print(f"  wrote {a.output}")
+    if not a.verify:
+        return 0
+    m = Machine(rig.chip)
+    m.fsync_enabled = a.fsync
+    for addr, d in prog.segments():
+        m.load(d, addr)
+    m.entry = prog.entry
+    for addr, ws in pokes:
+        m.poke_words(addr, ws)
+    emu = b"".join(m.run_pass(sample).fifo for _ in range(max(ints, 1)))
+    bad = []
+    if a.seconds is None and (a.passes or 1) == 1:
+        same = data == emu
+    else:                                   # the stop lands mid-pass: agree where both have bytes
+        n = min(len(data), len(emu))
+        same = data[:n] == emu[:n] and (n > 0 or data == emu)
+    if not same:
+        bad.append(f"FIFO: silicon {data.hex() or '-'}, emulator {emu.hex() or '-'}")
+    for addr, mem in got:
+        e = bytes(m.mem[addr:addr + len(mem)])
+        if e != mem:
+            bad.append(f"{addr:#06x}: silicon {mem.hex()}, emulator {e.hex()}")
+    print("  emulator: " + ("BIT-EXACT" if not bad else "DIFFERS (results that read live sensor "
+                                                       "data differ by nature)"))
+    for b in bad:
+        print(f"    {b}")
+    return 0 if not bad else 1
 
 
 def _assignment(text):
@@ -331,8 +424,19 @@ def main(argv=None):
     r.add_argument("file")
     r.add_argument("--name")
     r.add_argument("--port", required=True, help="the bridge's serial port (the part is detected)")
-    r.add_argument("--seconds", type=float, default=3.0)
-    r.add_argument("--rate", type=float, help="sample rate override (the bridge reads ~5 KB/s)")
+    r.add_argument("--seconds", type=float, help="run time (default 3; a .asm runs one pass)")
+    r.add_argument("--rate", type=float, help="sample rate override (the bridge reads ~5 KB/s); "
+                                              "a .asm runs at 50 Hz unless given")
+    r.add_argument("--passes", type=int, help=".asm: run N passes (default 1)")
+    r.add_argument("--gyro-fs", type=int, default=2000, help=".asm: gyro full scale, deg/s")
+    r.add_argument("--accel-fs", type=int, default=2, help=".asm: accel full scale, g")
+    r.add_argument("--fsync", action="store_true", help=".asm: FSYNC into the temperature's bit 0")
+    r.add_argument("--dump", action="append", default=[], metavar="ADDR:LEN",
+                   help=".asm: print DMP memory afterwards (repeatable)")
+    r.add_argument("--poke", action="append", default=[], metavar="ADDR=W[,W..]",
+                   help=".asm: write words before the start (hex, 0.5q or 100i)")
+    r.add_argument("--sample", help=".asm --verify: the sample the emulator gives every pass "
+                                    "(ax=100,gz=-5; default zeros)")
     r.add_argument("--verify", action="store_true",
                    help="a trace build, replayed in the emulator and the reference: bit-exact or not")
     r.add_argument("-o", "--output", help="write the decoded packets as CSV")

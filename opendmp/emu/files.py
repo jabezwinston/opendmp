@@ -62,22 +62,42 @@ def read_sensor_csv(path, units: str = "raw", accel_fs: float = 2, gyro_fs: floa
         raise ValueError(f"{path}: the first row must be a header naming the columns")
     if units not in ("raw", "si"):
         raise ValueError("units is 'raw' or 'si'")
-    a_lsb, g_lsb = 32768 / accel_fs, 32768 / gyro_fs
-    t_lsb, t_off = TEMP_SI["icm20948" if chip.startswith("icm") else "mpu6050"]
     out = []
     for n, row in enumerate(rows[1:], 2):
         try:
             v = {k: _num(row[i]) for k, i in cols.items() if i < len(row) and row[i].strip()}
         except ValueError as e:
             raise ValueError(f"{path}:{n}: {e}") from None
-        if units == "si":
-            for k in ("ax", "ay", "az"):
-                if k in v: v[k] *= a_lsb
-            for k in ("gx", "gy", "gz"):
-                if k in v: v[k] *= g_lsb
-            if "temp" in v: v["temp"] = (v["temp"] - t_off) * t_lsb
-        out.append(Sample(**{k: int(round(x)) for k, x in v.items()}))
+        out.append(_to_sample(v, units, accel_fs, gyro_fs, chip))
     return out
+
+
+def _to_sample(v: dict, units: str, accel_fs: float, gyro_fs: float, chip: str) -> Sample:
+    """Field values (raw counts, or SI: g, deg/s, deg C) as a Sample of raw counts."""
+    if units == "si":
+        a_lsb, g_lsb = 32768 / accel_fs, 32768 / gyro_fs
+        t_lsb, t_off = TEMP_SI["icm20948" if chip.startswith("icm") else "mpu6050"]
+        for k in ("ax", "ay", "az"):
+            if k in v: v[k] *= a_lsb
+        for k in ("gx", "gy", "gz"):
+            if k in v: v[k] *= g_lsb
+        if "temp" in v: v["temp"] = (v["temp"] - t_off) * t_lsb
+    return Sample(**{k: int(round(x)) for k, x in v.items()})
+
+
+def parse_sample(text: str, units: str = "raw", accel_fs: float = 2, gyro_fs: float = 2000,
+                 chip: str = "mpu6050") -> Sample:
+    """'ax=100,gz=-5' (any column name read_sensor_csv knows): one sample; '' is all zeros."""
+    v = {}
+    for item in filter(None, (x.strip() for x in text.split(","))):
+        k, _, val = item.partition("=")
+        k = k.strip().lower()
+        if k not in ALIASES or not val.strip():
+            raise ValueError(f"--sample: {item!r} (known: {', '.join(sorted(ALIASES))})")
+        v[ALIASES[k]] = _num(val)
+    if units not in ("raw", "si"):
+        raise ValueError("units is 'raw' or 'si'")
+    return _to_sample(v, units, accel_fs, gyro_fs, chip)
 
 
 def write_sensor_csv(path, samples, header=("ax", "ay", "az", "gx", "gy", "gz", "temp")):

@@ -5,9 +5,8 @@ instruction for both the MPU-6050 and the ICM-20948 DMP3 core).  The emulator is
 
 * `Unmodelled` is raised for any byte or state combination with no measured meaning (MPU `bf`,
   DMP3 `fc X Y` with X < 0xc0, both operand exchanges at once, ...).  It never guesses.
-* Where the manual leaves a behaviour unmeasured but a program cannot avoid it (what survives
-  from one pass to the next, how the multiply-accumulator rounds, ...), the choice is a named
-  field of `Model`, so a result can always be traced to the assumption it rests on.
+* Every choice the silicon has settled is the default of a named `Model` field; the other
+  values exist for experiments, so a result can always be traced to the rule it rests on.
 """
 from __future__ import annotations
 
@@ -20,7 +19,6 @@ from .chips import Chip, get_chip
 from .disasm import disasm
 
 
-UNKNOWN_F = object()      # F after an op whose flag rule is not measured
 
 
 class Unmodelled(Exception):
@@ -32,27 +30,33 @@ class DmpFault(Exception):
     a pointer or PC outside memory)."""
 
 
-CARRY_ALL = ("pointers", "p2word", "route", "mode", "xchg", "predicate", "flags")
+CARRY_ALL = ("pointers", "p2word", "route", "mode", "xchg", "predicate", "flags", "acc")
+# What survives into the next pass, measured on both parts (InvensenseDMP probe86 C, Finding 51):
+# pointers and P2's word index (the MPU's: DMP3 restarts them whatever this says), the route, the
+# mode, F and R.  "predicate" is assumed: compiled code opens every pass with `always`.
 CARRY_MEASURED = ("pointers", "p2word", "route", "mode", "predicate", "flags", "acc")
+MODEL_CHOICES = {"mac_restart": ("chip", "move", "op", "none"), "mac_precision": ("q60", "q30"),
+                 "icm_f0": ("mac", "width")}
 
 
 @dataclass
 class Model:
-    """Behaviours the emulator must pick because the silicon has not settled them.
+    """The emulator's model of the machine.  Every default is the measured behaviour; the other
+    choices exist for experiments.
 
-    mac_restart    what starts a fresh multiply-accumulate sum.  "chip" (default) = measured:
-                   on the MPU any move of the destination (op&4, a P2 page load, d0, df, an
-                   advancing MOV) [HW, probe86 B]; on DMP3 only an ALU op's own op&4
-                   pre-advance [HW, probe88].  Or force "move", "op" or "none".
-    mac_precision  "q60": products are summed exactly and the sum is floored once [HW both,
-                   probe86 B / probe88].  "q30": each product is floored before it is added.
-    icm_f0         DMP3 `f0`: "mac" (default: the multiply-accumulator, as on the MPU [HW,
-                   probe88]) or "width" (a plain 32-bit store, the decoder's old reading).
-    carry          machine state that survives from one pass to the next.  Measured on the
-                   MPU (probe86 C): pointers, the P2 word index, route, mode and flags survive;
-                   the fc/fd exchanges do not.  Always: the MAC accumulator resets [HW]; DMP3
-                   blocks reset and its mode register (mode 4) survives [HW]; the MPU block
-                   field survives [HW].
+    mac_restart    how a multiply-accumulate sum restarts.  "chip" (default, measured): on the MPU
+                   any move of the destination (op&4, a P2 page or bank load, d0, df, an advancing
+                   MOV) zeroes R, and that is the whole restart [HW, Findings 45, 54]; on DMP3 a
+                   MAC op's own op&4 starts a fresh sum and moves keep R [HW, probe88].  "move",
+                   "op" or "none" force one rule on both.
+    mac_precision  "q60" (default): products are summed exactly in a 64-bit register (Q60 in
+                   [-8, 8), wrapping) and floored when stored [HW, Findings 37, 44].  "q30": each
+                   product is floored before it is added.
+    icm_f0         DMP3 `f0`: "mac" (default, measured [HW, probe88]) or "width" (a 32-bit store).
+    carry          the state that survives from one pass to the next (CARRY_ALL names the keys);
+                   default CARRY_MEASURED.  DMP3 restarts its pointers, P2 index and blocks every
+                   pass whatever this says, and keeps its return stack; the MPU keeps its block
+                   field; the fc/fd exchanges never survive.
     max_steps      instructions after which a pass is declared runaway.
     """
     mac_restart: str = "chip"
@@ -60,6 +64,16 @@ class Model:
     icm_f0: str = "mac"
     carry: tuple = CARRY_MEASURED
     max_steps: int = 200_000
+
+    def __post_init__(self):
+        for k, ok in MODEL_CHOICES.items():
+            if getattr(self, k) not in ok:
+                raise ValueError(f"Model.{k} = {getattr(self, k)!r}: one of {', '.join(ok)}")
+        bad = set(self.carry) - set(CARRY_ALL)
+        if bad:
+            raise ValueError(f"Model.carry: unknown {', '.join(sorted(bad))} (known: {', '.join(CARRY_ALL)})")
+        if self.max_steps <= 0:
+            raise ValueError("Model.max_steps must be positive")
 
 
 @dataclass
@@ -400,8 +414,6 @@ class Machine:
             self.f = f
 
     def _cond(self, b: int) -> bool:
-        if self.f is UNKNOWN_F:
-            raise Unmodelled("a predicate reads F where its rule is not modelled")
         return (not self.f) if b == 0xDA else self.f
 
     # ------------------------------------------------------------------ execution

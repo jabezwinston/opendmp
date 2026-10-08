@@ -1,6 +1,8 @@
 """The command line, fed entirely from files."""
 import csv
 
+import pytest
+
 from opendmp.emu.__main__ import main
 from opendmp.emu.files import read_sensor_csv
 
@@ -24,3 +26,34 @@ def test_si_units(tmp_path):
     (tmp_path / "s.csv").write_text("ax ay az gx gy gz temp\n1.0 -0.5 0 250 0 -2000 36.53\n")
     s = read_sensor_csv(tmp_path / "s.csv", units="si", accel_fs=2, gyro_fs=2000)[0]
     assert (s.ax, s.ay, s.gx, s.gz, s.temp) == (16384, -8192, 4096, -32768, 0)
+
+
+ASM = ".chip mpu6050\nfmode 1\nalways\nfifo\np0bank 0\np0page 0\nmov 0\nint\nend\n"   # emit word 0
+
+
+def test_asm_with_a_fixed_sample(tmp_path, capsys):
+    """No sensor file: every pass sees --sample (zeros if omitted)."""
+    (tmp_path / "p.asm").write_text(ASM)
+    for extra, want in (([], "00000000"), (["--sample", "ax=100,ay=-2"], "0064fffe")):
+        assert main(["--load", str(tmp_path / "p.asm"), "--passes", "2", "--fifo", str(tmp_path / "o.bin")]
+                    + extra) == 0
+        assert (tmp_path / "o.bin").read_bytes() == bytes.fromhex(want) * 2
+    assert "2 passes over 2 samples" in capsys.readouterr().out
+
+
+def test_sample_and_sensors_conflict(tmp_path):
+    (tmp_path / "p.asm").write_text(ASM)
+    (tmp_path / "s.csv").write_text("ax\n1\n")
+    with pytest.raises(SystemExit, match="give one"):
+        main(["--load", str(tmp_path / "p.asm"), "--sensors", str(tmp_path / "s.csv"), "--sample", "ax=1"])
+    with pytest.raises(SystemExit, match="'bx=1'"):
+        main(["--load", str(tmp_path / "p.asm"), "--sample", "bx=1"])
+
+
+def test_model_values_are_checked(tmp_path):
+    (tmp_path / "p.asm").write_text(ASM)
+    with pytest.raises(SystemExit, match="mac_restart = 'advance': one of chip, move, op, none"):
+        main(["--load", str(tmp_path / "p.asm"), "--model", "mac_restart=advance"])
+    with pytest.raises(SystemExit, match="unknown xchgs"):
+        main(["--load", str(tmp_path / "p.asm"), "--model", "carry=pointers,xchgs"])
+    assert main(["--load", str(tmp_path / "p.asm"), "--model", "carry=none", "--model", "mac_precision=q30"]) == 0
