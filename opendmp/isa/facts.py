@@ -155,7 +155,9 @@ FACTS = [
          HW, "Findings 25, 64, probe51/64; Finding 46, probe110"),
     Fact("lo.icm", ICM, "d2/d3 store R's low 30 bits, sign-extended from bit 29: a product's, or "
          "a MAC run's sum", HW, "probe51; Finding 46, probe110"),
-    Fact("movz.icm", ICM, "bf toggles MOV-stores-zero", HW, "Finding 35, probe83d/e"),
+    Fact("movz.icm", ICM, "bf toggles a latch under which a MOV stores not its source but a value "
+         "that depends on the FIFO (0 when fresh, else an emitted word): never", HW,
+         "Finding 35, probe83d/e; Finding 53, probe115"),
     Fact("io.icm", ICM, "A page load under mode 4 addresses the host register file (register "
          "k = a/4, bank k >> 7); blocks 2-3 reach nothing", HW, "Finding 34, probe82"),
     # --- timing -------------------------------------------------------------------------------

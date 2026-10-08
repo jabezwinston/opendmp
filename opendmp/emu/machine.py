@@ -478,7 +478,7 @@ class Machine:
                 P = self.p[v]
                 P.block = (P.block + 1) % self.chip.block_mod   # [HW, probe47/84]
             elif icm:
-                self.bf = not self.bf               # MOV stores zero while set [HW, probe83d/e]
+                self.bf = not self.bf               # a MOV under it stores a FIFO-dependent value
             else:
                 raise Unmodelled("bf on the MPU corrupts stores unpredictably (probe84b)")
             return "cheap"
@@ -666,8 +666,8 @@ class Machine:
         val = self._read(self._srcs()[2], k)
         if v & 8:                                   # MOVX: half-words exchanged [HW]
             val = s32(((val & 0xFFFF) << 16) | ((val >> 16) & 0xFFFF))
-        if self.icm and self.bf:
-            val = 0
+        if self.icm and self.bf:                    # 0 only with a fresh FIFO; else the last word
+            raise Unmodelled("MOV under movz: the value depends on the FIFO's state (probe115)")
         return ("movx" if v & 8 else "mov") + self._store(val)
 
     def _incdec(self, b: int) -> str:
